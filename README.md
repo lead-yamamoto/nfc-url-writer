@@ -16,6 +16,10 @@ Getting an ACR122U talking to `libnfc` on a modern Mac is famously fiddly. This 
 
 </div>
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="NFC URL Writer — native macOS app" width="760" />
+</p>
+
 ---
 
 ## What it does
@@ -46,9 +50,7 @@ The usual fix is a cryptic dance with `launchctl bootout` / `disable` followed b
 
 ## Screenshots
 
-> **Tip:** a screenshot or short GIF here is the single biggest thing you can do for stars.
-> Capture the app window (`⌘⇧4` → `Space` → click the window), save it as `assets/screenshot.png`,
-> then add `![NFC URL Writer](assets/screenshot.png)` to this section.
+![NFC URL Writer — native macOS app](assets/screenshot.png)
 
 ## Requirements
 
