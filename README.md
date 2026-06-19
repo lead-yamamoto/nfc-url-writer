@@ -63,7 +63,7 @@ The usual fix is a cryptic dance with `launchctl bootout` / `disable` followed b
 
 ### Easiest: the app
 
-1. Download / build **`NFC URL Writer.app`** (see [Building from source](#building-from-source)).
+1. **[Download `NFC URL Writer.app`](https://github.com/lead-yamamoto/nfc-url-writer/releases/latest)** (or [build from source](#building-from-source)).
 2. Open it. On first run, if the NFC tools are missing, click **Install required tools** — the app runs `brew install libnfc libfreefare` for you.
 3. Plug in the ACR122U, place a card on it, type your URL, and click **Write**.
 
