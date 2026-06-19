@@ -65,9 +65,10 @@ The usual fix is a cryptic dance with `launchctl bootout` / `disable` followed b
 
 ### Easiest: the app
 
-1. **[Download `NFC URL Writer.app`](https://github.com/lead-yamamoto/nfc-url-writer/releases/latest)** (or [build from source](#building-from-source)).
-2. Open it. On first run, if the NFC tools are missing, click **Install required tools** — the app runs `brew install libnfc libfreefare` for you.
-3. Plug in the ACR122U, place a card on it, type your URL, and click **Write**.
+1. Open the **[latest release](https://github.com/lead-yamamoto/nfc-url-writer/releases/latest)** and download **`NFC-URL-Writer-macOS.zip`** from the **Assets** section — **not** the "Source code" archive (that's source only, no app). Unzip it to get `NFC URL Writer.app`. (Or [build from source](#building-from-source).)
+2. **First launch:** the app is unsigned, so macOS blocks it once. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** (macOS 15+); or run `xattr -dr com.apple.quarantine "NFC URL Writer.app"` in Terminal.
+3. If the NFC tools are missing, click **Install required tools** — the app runs `brew install libnfc libfreefare` for you.
+4. Plug in the ACR122U, place a card on it, type your URL, and click **Write**.
 
 ### Or install the dependencies yourself
 
