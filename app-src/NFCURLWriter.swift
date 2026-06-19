@@ -1,0 +1,491 @@
+import SwiftUI
+import Foundation
+
+// MARK: - シェル実行ヘルパ
+
+enum Shell {
+    /// Finder から起動した GUI アプリは最小限の環境しか持たないため Homebrew の bin を PATH に足す。
+    static func augmentedEnv(_ extra: [String: String] = [:]) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let brew = "/opt/homebrew/bin:/usr/local/bin"
+        let cur = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = brew + ":" + cur
+        env["TERM"] = "dumb"
+        for (k, v) in extra { env[k] = v }
+        return env
+    }
+
+    static func run(_ launch: String, _ args: [String], env: [String: String]) -> (Int32, String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: launch)
+        p.arguments = args
+        p.environment = env
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do {
+            try p.run()
+        } catch {
+            return (-1, "起動に失敗しました: \(error.localizedDescription)")
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let raw = String(data: data, encoding: .utf8) ?? ""
+        return (p.terminationStatus, stripANSI(raw))
+    }
+
+    static func stripANSI(_ s: String) -> String {
+        guard let re = try? NSRegularExpression(pattern: "\u{1B}\\[[0-9;]*m") else { return s }
+        return re.stringByReplacingMatches(
+            in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "")
+    }
+}
+
+// MARK: - モデル
+
+final class AppModel: ObservableObject {
+    @Published var url: String { didSet { UserDefaults.standard.set(url, forKey: "targetURL") } }
+    @Published var log: String
+    @Published var status: String = ""
+    @Published var statusKind: Int = 0   // 0=なし 1=実行中 2=成功 3=失敗
+    @Published var busy: Bool = false
+    @Published var depsOK: Bool = AppModel.depsInstalled()
+
+    init() {
+        if let saved = UserDefaults.standard.string(forKey: "targetURL"), !saved.isEmpty {
+            url = saved
+        } else {
+            url = AppModel.defaultURLFromScript() ?? "https://example.com"
+        }
+        log = """
+        カードをリーダーに置き、操作を選んでください。
+
+        ・通常は「書き込む」だけでOK（新品カードでもそのまま書けます）
+        ・「書き込む」が失敗する／カードを初期化したい時だけ「フォーマット（初期化）」
+        ・確認だけ … 「読み取り検証」（カードは変更しません）
+        ・認識されない … 「リーダー解放」（パスワード → 抜き差し）
+        """
+    }
+
+    static func scriptPath() -> String? {
+        Bundle.main.path(forResource: "write-url", ofType: "sh")
+    }
+
+    static func defaultURLFromScript() -> String? {
+        guard let path = scriptPath(),
+              let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        for raw in text.split(separator: "\n") {
+            let line = String(raw)
+            guard line.hasPrefix("TARGET_URL=") else { continue }
+            guard let q1 = line.firstIndex(of: "\""),
+                  let q2 = line.lastIndex(of: "\""), q1 < q2 else { return nil }
+            var v = String(line[line.index(after: q1)..<q2])
+            let pfx = "${TARGET_URL:-"
+            if v.hasPrefix(pfx) && v.hasSuffix("}") {
+                v = String(v.dropFirst(pfx.count).dropLast())
+            }
+            return v
+        }
+        return nil
+    }
+
+    func backupDir() -> String {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("NFC URL Writer", isDirectory: true)
+            .appendingPathComponent("backups", isDirectory: true)
+        try? fm.createDirectory(at: base, withIntermediateDirectories: true)
+        return base.path
+    }
+
+    func run(_ action: String) {
+        if (action == "write" || action == "format")
+            && url.trimmingCharacters(in: .whitespaces).isEmpty {
+            status = "URL を入力してください"; statusKind = 3
+            return
+        }
+        busy = true
+        status = "実行中…"; statusKind = 1
+        log = "実行中… カードをリーダーから動かさないでください。"
+        let u = url.trimmingCharacters(in: .whitespaces)
+        let backup = backupDir()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = AppModel.execute(action: action, url: u, backupDir: backup)
+            DispatchQueue.main.async {
+                self.log = result.1.isEmpty ? "(出力なし)" : result.1
+                self.busy = false
+                self.status = result.0 == 0 ? "成功" : "失敗"
+                self.statusKind = result.0 == 0 ? 2 : 3
+            }
+        }
+    }
+
+    static func execute(action: String, url: String, backupDir: String) -> (Int32, String) {
+        if action == "fix" {
+            let inner = "launchctl bootout system/com.apple.ifdreader; "
+                + "launchctl disable system/com.apple.ifdreader; "
+                + "launchctl bootout system/com.apple.usbsmartcardreaderd; "
+                + "launchctl disable system/com.apple.usbsmartcardreaderd; true"
+            let osa = "do shell script \"\(inner)\" with administrator privileges"
+            let (rc, out) = Shell.run("/usr/bin/osascript", ["-e", osa], env: Shell.augmentedEnv())
+            let extra = rc == 0
+                ? "\n\nmacOS のスマートカードデーモンを無効化しました。\n→ ACR122U を一度抜き差ししてから、もう一度操作してください。"
+                : ""
+            return (rc, out + extra)
+        }
+        guard let script = scriptPath() else {
+            return (-1, "アプリ内に write-url.sh が見つかりません。")
+        }
+        var args = [script]
+        var env: [String: String] = ["NFC_BACKUP_DIR": backupDir]
+        switch action {
+        case "write":  args += ["--yes"]; env["TARGET_URL"] = url
+        case "format": args += ["--format", "--yes"]; env["TARGET_URL"] = url
+        case "read":   args += ["--read", "--yes"]
+        default: return (-1, "不明な操作です。")
+        }
+        return Shell.run("/bin/bash", args, env: Shell.augmentedEnv(env))
+    }
+
+    // MARK: 依存ツール（libnfc / libfreefare）のセットアップ
+
+    static func toolExists(_ name: String) -> Bool {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            if FileManager.default.isExecutableFile(atPath: "\(dir)/\(name)") { return true }
+        }
+        return false
+    }
+
+    static func depsInstalled() -> Bool {
+        toolExists("nfc-list") && toolExists("mifare-classic-write-ndef")
+    }
+
+    static func brewPath() -> String? {
+        for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"] {
+            if FileManager.default.isExecutableFile(atPath: p) { return p }
+        }
+        return nil
+    }
+
+    func recheckDeps() {
+        depsOK = AppModel.depsInstalled()
+        if depsOK {
+            status = "準備完了"; statusKind = 2
+            log = "必要なツールを確認しました。書き込みできます。"
+        } else {
+            status = "未検出"; statusKind = 3
+            log = "まだ見つかりません。「必要なツールをインストール」を実行してください。"
+        }
+    }
+
+    func installDeps() {
+        busy = true; status = "インストール中…"; statusKind = 1
+        if let brew = AppModel.brewPath() {
+            let header = "Homebrew で libnfc / libfreefare をインストール中…\n（数分かかることがあります。完了までお待ちください）\n\n"
+            log = header
+            let env = Shell.augmentedEnv(["HOMEBREW_NO_AUTO_UPDATE": "1", "NONINTERACTIVE": "1"])
+            AppModel.runStreaming(brew, ["install", "libnfc", "libfreefare"], env: env,
+                onLine: { text in self.log = header + text },
+                done: { _ in
+                    self.busy = false
+                    self.depsOK = AppModel.depsInstalled()
+                    if self.depsOK {
+                        self.status = "準備完了"; self.statusKind = 2
+                        self.log += "\n\n✅ インストール完了。書き込みできます。"
+                    } else {
+                        self.status = "失敗"; self.statusKind = 3
+                        self.log += "\n\n⚠️ うまくいかなかった可能性があります。ターミナルで\n  brew install libnfc libfreefare\nをお試しください。"
+                    }
+                })
+        } else {
+            // Homebrew 自体が無い → ターミナルでセットアップ（管理者パスワードが必要）
+            log = "Homebrew が見つかりません。ターミナルでセットアップを開始します…\n（管理者パスワードを求められます）"
+            AppModel.openTerminalSetup()
+            busy = false
+            status = "ターミナルで続行"; statusKind = 1
+            log += "\n\nターミナルでインストールが終わったら、「再確認」を押してください。"
+        }
+    }
+
+    /// 出力を逐次受け取りながらコマンドを実行する（インストールの進捗表示用）。
+    static func runStreaming(_ launch: String, _ args: [String], env: [String: String],
+                             onLine: @escaping (String) -> Void, done: @escaping (Int32) -> Void) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: launch)
+        p.arguments = args
+        p.environment = env
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        let handle = pipe.fileHandleForReading
+        let lock = NSLock()
+        var buffer = Data()
+        handle.readabilityHandler = { h in
+            let d = h.availableData
+            guard !d.isEmpty else { return }
+            lock.lock(); buffer.append(d); let snap = buffer; lock.unlock()
+            let text = String(data: snap, encoding: .utf8).map { Shell.stripANSI($0) } ?? ""
+            DispatchQueue.main.async { onLine(text) }
+        }
+        p.terminationHandler = { proc in
+            handle.readabilityHandler = nil
+            let rest = handle.readDataToEndOfFile()
+            lock.lock(); if !rest.isEmpty { buffer.append(rest) }; let snap = buffer; lock.unlock()
+            let text = String(data: snap, encoding: .utf8).map { Shell.stripANSI($0) } ?? ""
+            DispatchQueue.main.async { onLine(text); done(proc.terminationStatus) }
+        }
+        do { try p.run() } catch {
+            handle.readabilityHandler = nil
+            DispatchQueue.main.async { done(-1) }
+        }
+    }
+
+    /// Homebrew が無い場合：ターミナルで Homebrew → libnfc/libfreefare を導入する。
+    static func openTerminalSetup() {
+        let script = """
+        #!/bin/bash
+        echo '==> NFC URL Writer セットアップ'
+        if ! command -v brew >/dev/null 2>&1; then
+          echo '==> Homebrew をインストールします（管理者パスワードを求められます）'
+          NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        fi
+        eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"
+        echo '==> libnfc / libfreefare をインストールします'
+        brew install libnfc libfreefare
+        echo
+        echo '✅ 完了しました。NFC URL Writer に戻って「再確認」を押してください。'
+        """
+        let tmp = NSTemporaryDirectory() + "nfc-setup.command"
+        try? script.write(toFile: tmp, atomically: true, encoding: .utf8)
+        _ = Shell.run("/bin/chmod", ["+x", tmp], env: Shell.augmentedEnv())
+        let osa = "tell application \"Terminal\"\nactivate\ndo script \"bash '\(tmp)'\"\nend tell"
+        _ = Shell.run("/usr/bin/osascript", ["-e", osa], env: Shell.augmentedEnv())
+    }
+}
+
+// MARK: - 配色
+
+enum Palette {
+    static let indigo = Color(red: 0.33, green: 0.28, blue: 0.93)
+    static let teal   = Color(red: 0.02, green: 0.72, blue: 0.85)
+    static let green  = Color(red: 0.13, green: 0.66, blue: 0.36)
+    static let blue   = Color(red: 0.10, green: 0.45, blue: 0.90)
+    static let slate  = Color(red: 0.40, green: 0.45, blue: 0.55)
+    static let amber  = Color(red: 0.86, green: 0.55, blue: 0.10)
+    static let console = Color(red: 0.078, green: 0.086, blue: 0.12)
+}
+
+// MARK: - ボタン
+
+private struct PrimaryButton: View {
+    let title: String; let icon: String; let tint: Color; let busy: Bool; let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(maxWidth: .infinity, minHeight: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(tint)
+        .controlSize(.large)
+        .disabled(busy)
+    }
+}
+
+private struct SecondaryButton: View {
+    let title: String; let icon: String; let tint: Color; let busy: Bool; let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(maxWidth: .infinity, minHeight: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.bordered)
+        .tint(tint)
+        .controlSize(.large)
+        .disabled(busy)
+    }
+}
+
+// MARK: - 画面
+
+struct ContentView: View {
+    @StateObject private var model = AppModel()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header
+            setupCard
+            urlField
+            buttons
+            statusRow
+            console
+            footer
+        }
+        .padding(22)
+        .frame(minWidth: 560, minHeight: 660)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    // ヘッダ（グラデーションのアイコンタイル + タイトル）
+    private var header: some View {
+        HStack(spacing: 14) {
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .fill(LinearGradient(colors: [Palette.indigo, Palette.teal],
+                                     startPoint: .topLeading, endPoint: .bottomTrailing))
+                .frame(width: 56, height: 56)
+                .overlay(
+                    Image(systemName: "dot.radiowaves.right")
+                        .font(.system(size: 26, weight: .bold))
+                        .foregroundColor(.white))
+                .shadow(color: Palette.indigo.opacity(0.35), radius: 6, y: 3)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("NFC URL Writer")
+                    .font(.system(size: 22, weight: .bold))
+                Text("ACR122U + MIFARE Classic 1K に NDEF URL を書き込みます")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+    }
+
+    @ViewBuilder private var setupCard: some View {
+        if !model.depsOK {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "shippingbox.fill").foregroundColor(Palette.blue)
+                    Text("初回セットアップ").font(.system(size: 13, weight: .semibold))
+                }
+                Text("NFC の読み書きに必要なツール（libnfc / libfreefare）が見つかりません。下のボタンでインストールできます（Homebrew を使用。数分かかることがあります）。")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    PrimaryButton(title: "必要なツールをインストール", icon: "arrow.down.circle.fill",
+                                  tint: Palette.blue, busy: model.busy) { model.installDeps() }
+                    SecondaryButton(title: "再確認", icon: "arrow.clockwise",
+                                    tint: Palette.slate, busy: model.busy) { model.recheckDeps() }
+                }
+            }
+            .padding(12)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Palette.blue.opacity(0.4), lineWidth: 1))
+        }
+    }
+
+    private var urlField: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("書き込む URL")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.secondary)
+            HStack(spacing: 8) {
+                Image(systemName: "link").foregroundColor(.secondary)
+                TextField("https://example.com", text: $model.url)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 15))
+                    .disabled(model.busy)
+            }
+            .padding(.horizontal, 13).padding(.vertical, 11)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
+        }
+    }
+
+    private var buttons: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                PrimaryButton(title: "フォーマット（初期化）", icon: "arrow.triangle.2.circlepath",
+                              tint: Palette.blue, busy: model.busy || !model.depsOK) { model.run("format") }
+                PrimaryButton(title: "書き込む", icon: "square.and.arrow.down.fill",
+                              tint: Palette.green, busy: model.busy || !model.depsOK) { model.run("write") }
+            }
+            HStack(spacing: 10) {
+                SecondaryButton(title: "読み取り検証", icon: "magnifyingglass",
+                                tint: Palette.slate, busy: model.busy || !model.depsOK) { model.run("read") }
+                SecondaryButton(title: "リーダー解放", icon: "wrench.and.screwdriver.fill",
+                                tint: Palette.amber, busy: model.busy) { model.run("fix") }
+            }
+        }
+    }
+
+    @ViewBuilder private var statusRow: some View {
+        if !model.status.isEmpty {
+            HStack(spacing: 7) {
+                if model.busy {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: model.statusKind == 2 ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                }
+                Text(model.status).font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundColor(statusColor)
+            .padding(.horizontal, 13).padding(.vertical, 6)
+            .background(Capsule().fill(statusColor.opacity(0.14)))
+        }
+    }
+
+    private var console: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "terminal").font(.system(size: 11, weight: .semibold))
+                Text("ログ").font(.system(size: 11, weight: .semibold))
+                Spacer()
+                if model.busy { ProgressView().controlSize(.small) }
+            }
+            .foregroundColor(.white.opacity(0.7))
+            .padding(.horizontal, 13).padding(.vertical, 9)
+
+            Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(model.log)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundColor(Color(red: 0.85, green: 0.90, blue: 1.0))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 13).padding(.vertical, 11)
+                    Color.clear.frame(height: 1).id("bottom")
+                }
+                .onChange(of: model.log) { _ in
+                    withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(Palette.console))
+        .frame(minHeight: 230)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "clock.arrow.circlepath").font(.system(size: 11))
+            Text("バックアップは ~/Library/Application Support/NFC URL Writer/backups に保存されます")
+                .font(.caption2)
+            Spacer()
+        }
+        .foregroundColor(.secondary.opacity(0.8))
+    }
+
+    private var statusColor: Color {
+        switch model.statusKind {
+        case 2: return Palette.green
+        case 3: return Color(red: 0.80, green: 0.25, blue: 0.20)
+        default: return Palette.slate
+        }
+    }
+}
+
+@main
+struct NFCURLWriterApp: App {
+    var body: some Scene {
+        WindowGroup("NFC URL Writer") {
+            ContentView()
+        }
+    }
+}

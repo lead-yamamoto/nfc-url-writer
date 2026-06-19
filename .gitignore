@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+**/.DS_Store
+__MACOSX/
+._*
+
+# Python
+__pycache__/
+*.pyc
+
+# Local tooling / editor config
+.claude/
+
+# Build output (reproducible: build-app.sh / build-tools.sh / make-icon.sh)
+/bin/
+*.app/
+*.zip
+AppIcon.iconset/
+
+# Card backups — sensitive (MIFARE Classic dumps)
+backups/
+*.mfd
