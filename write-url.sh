@@ -600,7 +600,7 @@ ensure_ndef_tools() {
 check_reader() {
   # まず対応リーダー(NXP系)を検出し、既定デバイスを固定する(安定性の要)。
   info "リーダーを確認しています…"
-  select_reader || die "対応リーダーの選択に失敗しました。"
+  select_reader || die "対応リーダー（ACR122U などの NXP系）が見つかりませんでした。ACR122U を USB に挿し直してください（一度抜いて数秒待つと復帰することがあります）。MIFARE Classic は NXP系リーダーが必須です（Sony PaSoRi/RC-S300 では Classic は書けません）。${READER_FOUND_LIST:+接続中: ${READER_FOUND_LIST}。}"
   if [ -n "$READER_NAME" ]; then
     ok "リーダーを確認しました（${READER_NAME}）"
     # アプリが拾えるよう、機械可読な1行を出力する(字下げして詳細扱い=かんたんログには出さない)。

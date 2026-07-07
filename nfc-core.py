@@ -583,7 +583,9 @@ def sw_ok(resp):
 #             ISO14443A 標準 APDU で NFC Forum Type2/Type4 は読み書きできるが、
 #             Crypto1 は非実装なので MIFARE Classic は扱えない。
 #   felica  : Sony FeliCa 系(RC-S300/RC-S380/PaSoRi/SONY Felica Port)。
-#             Type-A の Classic/Type2/Type4 は扱えず、FeliCa は検出のみ(書込は Phase5)。
+#             MIFARE Classic は Crypto1(NXP 専有)のため不可。NTAG/Type2・Type4 等の
+#             Type-A タグは原理的には扱える(RC-S380/PaSoRi は比較的安定、RC-S300 は
+#             独自プロトコルで不安定)ため実験的("exp")扱い。FeliCa 書込は Phase5。
 #   unknown : 上記いずれにも当てはまらない未分類リーダー。安全側に倒す。
 #
 # 判定は「大文字化した名前への部分一致(substring)」で、ベンダ接頭辞に強くする。
@@ -594,7 +596,7 @@ READER_FELICA = "felica"
 READER_UNKNOWN = "unknown"
 
 
-# FeliCa 系(Sony)。Type-A の Classic/Type2/Type4 は不可、FeliCa は検出のみ。
+# FeliCa 系(Sony)。MIFARE Classic は不可(Crypto1)、NTAG などの Type-A は実験的に可。
 # NOTE: これらは最優先で判定する(Sony 製品名は他の family キーワードと衝突しないが、
 #       "FELICA PORT" 等を確実に felica に寄せるため先頭で弾く)。
 _READER_KW_FELICA = (
@@ -644,7 +646,7 @@ def reader_family_label(family):
     return {
         READER_NXP: "PN53x系(ACR122U など。MIFARE Classic 対応)",
         READER_GENERIC: "汎用 Type-A リーダー(NTAG/Type2・Type4。Classic 非対応)",
-        READER_FELICA: "Sony/FeliCa系(RC-S300/RC-S380/PaSoRi。検出のみ)",
+        READER_FELICA: "Sony/FeliCa系(RC-S300/RC-S380/PaSoRi。Classic 不可・NTAG等 Type-A は実験的)",
         READER_UNKNOWN: "不明なリーダー",
     }.get(family, "不明なリーダー")
 
@@ -780,9 +782,11 @@ def detect_tag_live(card):
 # データ駆動。値: "ok"(正式対応) / "exp"(実験的対応) / "no"(非対応)。
 # ルール(ARCH / Phase2):
 #   MIFARE Classic  … Crypto1 認証が要るので PN53x 系(nxp)でのみ可。
-#                     汎用 Type-A CCID(generic)/FeliCa/未分類では不可。
+#                     汎用 Type-A CCID(generic)/FeliCa/未分類では不可(Crypto1 は NXP 専有)。
 #   Type2(NTAG等)  … ISO14443A 標準 APDU で読み書き。Type-A が通る nxp/generic で可。
-#   Type4(DESFire) … 同上(Type-A 標準 APDU)。nxp/generic で可(実装は Phase5 で本格化)。
+#                     Sony(felica)も NFC-A に応答するため原理的には可能で "exp"(実験的)扱い。
+#                     RC-S380/PaSoRi は Type-A 対応が比較的安定、RC-S300 は独自プロトコルで不安定。
+#   Type4(DESFire) … 同上(Type-A 標準 APDU)。nxp/generic で可、Sony(felica)は "exp"。
 #   FeliCa          … NDEF 書き込みは全リーダーで非対応(検出のみ。Phase5 まで)。
 #   unknown リーダー … 素性不明。Type-A が通るとは限らないので安全側で "no"(試行させない)。
 #                     ただし Classic だけは「PN53x 以外は原理的に不可」と同じ扱いで "no"。
@@ -791,7 +795,7 @@ CAPABILITY = {
     #                classic     type2       type4       felica
     READER_NXP:     {TAG_CLASSIC: "ok",  TAG_TYPE2: "exp", TAG_TYPE4: "exp", TAG_FELICA: "no"},
     READER_GENERIC: {TAG_CLASSIC: "no",  TAG_TYPE2: "exp", TAG_TYPE4: "exp", TAG_FELICA: "no"},
-    READER_FELICA:  {TAG_CLASSIC: "no",  TAG_TYPE2: "no",  TAG_TYPE4: "no",  TAG_FELICA: "no"},
+    READER_FELICA:  {TAG_CLASSIC: "no",  TAG_TYPE2: "exp", TAG_TYPE4: "exp", TAG_FELICA: "no"},
     READER_UNKNOWN: {TAG_CLASSIC: "no",  TAG_TYPE2: "no",  TAG_TYPE4: "no",  TAG_FELICA: "no"},
 }
 
@@ -807,15 +811,15 @@ _CLASSIC_WHY = ("MIFARE Classic は Crypto1 認証が必要で、"
 _INCOMPAT_MSG = {
     TAG_CLASSIC: {
         READER_GENERIC: _CLASSIC_WHY + "お使いのリーダーは Type-A の NTAG/Type4 には対応しますが Classic は扱えません。",
-        READER_FELICA:  _CLASSIC_WHY + "Sony RC-S300/RC-S380/PaSoRi では扱えません。",
+        READER_FELICA:  _CLASSIC_WHY + "Sony RC-S300/RC-S380/PaSoRi では **Classic は** 書けません（NTAG などの Type-A タグなら Sony でも扱えます）。",
         None:           _CLASSIC_WHY,
     },
     TAG_TYPE2: {
-        READER_FELICA: "NTAG/Type2 は ISO14443A(Type-A)対応リーダーが必要で、FeliCa専用リーダー(RC-S300 など)では扱えません。ACR122U 等をご利用ください。",
+        READER_FELICA: "NTAG/Type2 は ISO14443A(Type-A)タグです。Sony(RC-S380/PaSoRi など)でも原理的には扱えますが不安定なため、確実に書くなら ACR122U 等の Type-A 対応リーダーをご利用ください。",
         None:          "NTAG/Type2 を扱うには ISO14443A(Type-A)対応リーダーが必要です。ACR122U 等をご利用ください。",
     },
     TAG_TYPE4: {
-        READER_FELICA: "Type4(DESFire 等)は ISO14443A(Type-A)対応リーダーが必要で、FeliCa専用リーダー(RC-S300 など)では扱えません。ACR122U 等をご利用ください。",
+        READER_FELICA: "Type4(DESFire 等)は ISO14443A(Type-A)タグです。Sony(RC-S380/PaSoRi など)でも原理的には扱えますが不安定なため、確実に書くなら ACR122U 等の Type-A 対応リーダーをご利用ください。",
         None:          "Type4(DESFire 等)を扱うには ISO14443A(Type-A)対応リーダーが必要です。ACR122U 等をご利用ください。",
     },
     TAG_FELICA: {
@@ -1407,14 +1411,15 @@ def run_self_test():
         check("reader label %s 非空" % fam, bool(reader_family_label(fam)), True)
 
     # --- capability matrix(family × tag を全網羅)---
-    # 期待表: MIFARE Classic は PN53x(nxp)のみ。Type2/Type4 は nxp/generic。FeliCa は全滅。
+    # 期待表: MIFARE Classic は PN53x(nxp)のみ。Type2/Type4 は nxp/generic に加え
+    # Sony(felica)も実験的("exp")。FeliCa タグ書込は全滅。
     _CAP_CASES = {
         (READER_NXP,     TAG_CLASSIC): "ok",  (READER_NXP,     TAG_TYPE2): "exp",
         (READER_NXP,     TAG_TYPE4):   "exp", (READER_NXP,     TAG_FELICA): "no",
         (READER_GENERIC, TAG_CLASSIC): "no",  (READER_GENERIC, TAG_TYPE2): "exp",
         (READER_GENERIC, TAG_TYPE4):   "exp", (READER_GENERIC, TAG_FELICA): "no",
-        (READER_FELICA,  TAG_CLASSIC): "no",  (READER_FELICA,  TAG_TYPE2): "no",
-        (READER_FELICA,  TAG_TYPE4):   "no",  (READER_FELICA,  TAG_FELICA): "no",
+        (READER_FELICA,  TAG_CLASSIC): "no",  (READER_FELICA,  TAG_TYPE2): "exp",
+        (READER_FELICA,  TAG_TYPE4):   "exp", (READER_FELICA,  TAG_FELICA): "no",
         (READER_UNKNOWN, TAG_CLASSIC): "no",  (READER_UNKNOWN, TAG_TYPE2): "no",
         (READER_UNKNOWN, TAG_TYPE4):   "no",  (READER_UNKNOWN, TAG_FELICA): "no",
     }
@@ -1433,6 +1438,8 @@ def run_self_test():
     check("INCOMPAT classic×generic に PN53x", "PN53x" in msg_cg, True)
     msg_cf = incompat_message(TAG_CLASSIC, READER_FELICA)
     check("INCOMPAT classic×felica に PaSoRi 言及", "PaSoRi" in msg_cf, True)
+    check("INCOMPAT classic×felica に Crypto1", "Crypto1" in msg_cf, True)
+    check("INCOMPAT classic×felica に PN53x", "PN53x" in msg_cf, True)
     # Type2/Type4 を FeliCa リーダーで → Type-A が要る旨。
     check("INCOMPAT type2×felica に Type-A", "Type-A" in incompat_message(TAG_TYPE2, READER_FELICA), True)
     check("INCOMPAT type4×felica に Type-A", "Type-A" in incompat_message(TAG_TYPE4, READER_FELICA), True)

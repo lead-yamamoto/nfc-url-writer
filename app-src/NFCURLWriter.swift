@@ -887,7 +887,7 @@ struct ContentView: View {
 
     // ヘッダ（グラデーションのアイコンタイル + 一般化した副題）
     private var header: some View {
-        HStack(spacing: 14) {
+        HStack(alignment: .top, spacing: 14) {
             RoundedRectangle(cornerRadius: 15, style: .continuous)
                 .fill(LinearGradient(colors: [Palette.indigo, Palette.teal],
                                      startPoint: .topLeading, endPoint: .bottomTrailing))
@@ -905,7 +905,19 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
             Spacer()
+            Text(appVersionLabel)
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
         }
+    }
+
+    // バンドルから動的に取得したアプリバージョン（例: "v0.3.7"）。
+    // 開発実行中などでバンドル情報が無い場合はクラッシュせず "dev" にフォールバックする。
+    private var appVersionLabel: String {
+        if let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String, !v.isEmpty {
+            return "v\(v)"
+        }
+        return "dev"
     }
 
     @ViewBuilder private var setupCard: some View {
