@@ -1,5 +1,6 @@
 import SwiftUI
 import Foundation
+import AppKit
 
 // MARK: - シェル実行ヘルパ
 
@@ -737,6 +738,7 @@ struct ContentView: View {
     @StateObject private var model = AppModel()
     @State private var showCompat = false
     @State private var showRawLog = false
+    @State private var logCopied = false
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -992,27 +994,56 @@ struct ContentView: View {
         .frame(minHeight: 210)
     }
 
+    /// 生ログ（開発者向け詳細を含む全文）をクリップボードへコピーする。
+    /// 不具合報告時に貼り付けられる、最も有用な全文を対象にする。
+    private func copyRawLog() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(model.log, forType: .string)
+        withAnimation(.easeInOut(duration: 0.15)) { logCopied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation(.easeInOut(duration: 0.2)) { logCopied = false }
+        }
+    }
+
+    // ログ全文をコピーする小さなボタン（詳細ログのヘッダに配置）。
+    private var copyLogButton: some View {
+        Button(action: copyRawLog) {
+            HStack(spacing: 4) {
+                Image(systemName: logCopied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .semibold))
+                Text(logCopied ? "コピーしました" : "コピー")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundColor(logCopied ? Palette.green : Palette.blue)
+        }
+        .buttonStyle(.borderless)
+        .help("ログ全文（詳細を含む）をクリップボードにコピーします")
+    }
+
     // 詳細ログ：開発者/デバッグ向けに、キャプチャした生出力を等幅ダークで表示（既定は閉じる）。
     private var rawLogDisclosure: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) { showRawLog.toggle() }
-            } label: {
-                HStack(spacing: 7) {
-                    Image(systemName: "terminal")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.secondary)
-                    Text("詳細ログを表示")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.primary.opacity(0.85))
-                    Spacer()
-                    Image(systemName: showRawLog ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.secondary)
+            HStack(spacing: 7) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { showRawLog.toggle() }
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "terminal")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.secondary)
+                        Text("詳細ログを表示")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.primary.opacity(0.85))
+                        Image(systemName: showRawLog ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(.secondary)
+                    }
+                    .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.borderless)
+                Spacer()
+                copyLogButton
             }
-            .buttonStyle(.borderless)
 
             if showRawLog {
                 ScrollView {
