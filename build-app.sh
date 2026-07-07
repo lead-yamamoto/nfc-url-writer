@@ -77,6 +77,15 @@ PLIST
 echo "==> スクリプト・アイコンを同梱"
 cp write-url.sh build-tools.sh "$APP/Contents/Resources/"
 chmod +x "$APP/Contents/Resources/"*.sh
+# PC/SC backend(NFC_BACKEND=pcsc)用の nfc-core.py を write-url.sh の隣へ同梱する。
+# write-url.sh は $SCRIPT_DIR/nfc-core.py(= Resources 直下)を探して見つける。
+# 既定(libnfc)では使われない dark ファイル。python3(標準ライブラリのみ)で動く。
+if [ -f nfc-core.py ]; then
+  cp nfc-core.py "$APP/Contents/Resources/nfc-core.py"
+  echo "    nfc-core.py を同梱（PC/SC backend 用・dark）"
+else
+  echo "    ![注意] nfc-core.py がありません → PC/SC backend(NFC_BACKEND=pcsc)は使えません"
+fi
 [ -f AppIcon.icns ] && cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # ACR122U ブザー制御ヘルパ（任意）。事前ビルド済みの ./bin/acr122-beep があれば

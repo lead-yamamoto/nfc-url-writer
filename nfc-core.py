@@ -15,6 +15,8 @@
 #   python3 nfc-core.py --detect        リーダー/カードの状態判定のみ(書き込まない)
 #   python3 nfc-core.py --read          NDEF URL を読み取り
 #   python3 nfc-core.py --write <url>   NDEF URL を書き込み(env TARGET_URL も可)
+#   python3 nfc-core.py --format [<url>] 初期化してから書き込み(env TARGET_URL も可)
+#   python3 nfc-core.py --print-ndef    生成される NDEF バイト列を表示して終了(env TARGET_URL)
 #   python3 nfc-core.py --self-test     ハードウェア不要の単体テストを実行し 0/非0 で終了
 #
 # 出力コントラクト(Swift アプリ / かんたんログ が解釈する):
@@ -1042,6 +1044,18 @@ def cmd_read():
         ctx.release()
 
 
+def cmd_print_ndef(url):
+    """--print-ndef: ハードウェア不要。生成される NDEF バイト列を表示して終了。
+    write-url.sh --print-ndef と同じ stdout コントラクトを守る:
+        URL : <url>
+        NDEF: <hex>
+    """
+    ndef = build_ndef_message(url)
+    print("URL : %s" % url)
+    print("NDEF: %s" % ndef.hex())
+    return 0
+
+
 def cmd_write(url):
     ndef = build_ndef_message(url)
     setup = _live_setup()
@@ -1252,7 +1266,12 @@ def main(argv):
         return cmd_detect()
     if cmd == "--read":
         return cmd_read()
-    if cmd == "--write":
+    if cmd == "--print-ndef":
+        url = os.environ.get("TARGET_URL", TARGET_URL_DEFAULT)
+        return cmd_print_ndef(url)
+    if cmd in ("--write", "--format"):
+        # --format は Classic の format+write を内包する cmd_write に委ねる
+        # (libnfc backend の --format と同じ「初期化してから書き込み」意味)。
         url = argv[2] if len(argv) > 2 else os.environ.get("TARGET_URL", TARGET_URL_DEFAULT)
         return cmd_write(url)
     if cmd in ("--help", "-h"):

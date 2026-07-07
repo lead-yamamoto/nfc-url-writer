@@ -32,6 +32,18 @@ set -euo pipefail
 TARGET_URL="${TARGET_URL:-https://example.com/}"
 # ═════════════════════════════════════════════════════════════════════════════
 
+# --- バックエンド選択(NFC_BACKEND) ------------------------------------------
+# 既定 = libnfc(従来どおり。libnfc/libfreefare を使う出荷パス。何も変わらない)。
+# NFC_BACKEND=pcsc のときだけ、reader/detect/read/write/format/print-ndef を
+# python3 nfc-core.py(PC/SC=PCSC.framework 経由)へ委譲する。opt-in・dark。
+#   ・stdout コントラクト(マーカー行 / 使用リーダー: / カード種別を判定しました:
+#     / INCOMPAT: / --detect の READER:/TAG: / --print-ndef のバイト列)は
+#     nfc-core.py 側が同一契約で出力するため、アプリ/かんたんログはそのまま解釈できる。
+#   ・pcsc backend は macOS のスマートカードデーモン(com.apple.ifdreader)が
+#     「ON」である必要がある(PCSC.framework がそれ経由でリーダーに触るため)。
+#     → --enable-reader でデーモンを再有効化できる(--fix-reader の逆)。
+NFC_BACKEND="${NFC_BACKEND:-libnfc}"
+
 # --- 定数 --------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_BIN="$SCRIPT_DIR/bin"               # 自前ビルドしたツールの置き場
@@ -120,7 +132,8 @@ ${BOLD}write-url.sh${RST} — NFC タグに NDEF URL を書き込む (libnfc対�
   ./write-url.sh --format      初回。カードを NDEF フォーマットしてから URL を書く
   ./write-url.sh               2回目以降。URL の書き込みのみ
   ./write-url.sh --detect      リーダー/カードの状態を判定するだけ(書き込まない)
-  ./write-url.sh --fix-reader  macOS がリーダーを掴んでいる場合に解放する(sudo)
+  ./write-url.sh --fix-reader  macOS がリーダーを掴んでいる場合に解放する(sudo, libnfc用)
+  ./write-url.sh --enable-reader macOS のスマートカードデーモンを再有効化(sudo, PC/SC backend用)
   ./write-url.sh --print-ndef  TARGET_URL から生成される NDEF バイト列を表示して終了
   ./write-url.sh --read        カードに書かれている NDEF URL を読み取って表示
   ./write-url.sh --no-backup   書き込み前のバックアップを行わない
@@ -150,20 +163,21 @@ EOF
 }
 
 # --- 引数パース --------------------------------------------------------------
-DO_FORMAT=0; ASSUME_YES=0; DO_BACKUP=1; FIX_READER=0; PRINT_NDEF=0; DO_READ=0; SELF_TEST=0; DO_DETECT=0
+DO_FORMAT=0; ASSUME_YES=0; DO_BACKUP=1; FIX_READER=0; ENABLE_READER=0; PRINT_NDEF=0; DO_READ=0; SELF_TEST=0; DO_DETECT=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --format)     DO_FORMAT=1 ;;
-    --yes|-y)     ASSUME_YES=1 ;;
-    --no-backup)  DO_BACKUP=0 ;;
-    --no-sound)   NFC_SOUND=0 ;;
-    --fix-reader) FIX_READER=1 ;;
-    --print-ndef) PRINT_NDEF=1 ;;
-    --read)       DO_READ=1 ;;
-    --detect)     DO_DETECT=1 ;;   # リーダー/カードの状態判定のみ(書き込まない)
-    --verbose|-v) NFC_VERBOSE=1 ;; # 開発者向け: 生ツール出力(16進/UID/SAK 等)も表示
-    --self-test)  SELF_TEST=1 ;;   # 内部用: SAK 判定などの単体テスト
-    -h|--help)    usage; exit 0 ;;
+    --format)        DO_FORMAT=1 ;;
+    --yes|-y)        ASSUME_YES=1 ;;
+    --no-backup)     DO_BACKUP=0 ;;
+    --no-sound)      NFC_SOUND=0 ;;
+    --fix-reader)    FIX_READER=1 ;;
+    --enable-reader) ENABLE_READER=1 ;;  # ifdreader を再有効化(PC/SC backend 用。--fix-reader の逆)
+    --print-ndef)    PRINT_NDEF=1 ;;
+    --read)          DO_READ=1 ;;
+    --detect)        DO_DETECT=1 ;;   # リーダー/カードの状態判定のみ(書き込まない)
+    --verbose|-v)    NFC_VERBOSE=1 ;; # 開発者向け: 生ツール出力(16進/UID/SAK 等)も表示
+    --self-test)     SELF_TEST=1 ;;   # 内部用: SAK 判定などの単体テスト
+    -h|--help)       usage; exit 0 ;;
     *) err "不明なオプション: $1"; echo; usage; exit 2 ;;
   esac
   shift
@@ -490,6 +504,39 @@ build_ndef_message() {
   # D1 = MB|ME|SR|TNF(well-known), 01 = Type長, PL = Payload長, 55 = 'U', CODE, 残り
   hex="D101${pl_hex}55${URI_CODE}${rest_hex}"
   printf '%s' "$hex" | xxd -r -p > "$out"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PC/SC backend(NFC_BACKEND=pcsc)への委譲
+# ═════════════════════════════════════════════════════════════════════════════
+# nfc-core.py(PCSC.framework 経由)を呼び出す薄いラッパ。stdout はそのまま流す
+# (nfc-core.py が同一の stdout コントラクトで出力する)。python3 が無ければ die。
+# nfc-core.py はスクリプトと同じ階層に置かれる(リポジトリ実行時も .app バンドル時も
+# build-app.sh が Resources 直下へ同梱する)。
+NFC_CORE="$SCRIPT_DIR/nfc-core.py"
+
+pcsc_backend() {
+  require_cmd python3 || die "python3 が見つかりません(PC/SC backend には python3 が必要です)。"
+  [ -f "$NFC_CORE" ] || die "nfc-core.py が見つかりません: $NFC_CORE"
+  python3 "$NFC_CORE" "$@"
+}
+
+# --- macOS スマートカードデーモン再有効化(PC/SC backend 用) ----------------
+# --fix-reader の逆。PC/SC backend は com.apple.ifdreader が「ON」でないと
+# PCSC.framework がリーダーに触れない。--fix-reader で無効化した後、PC/SC を
+# 使いたい場合にこれで戻す。
+enable_reader() {
+  info "macOS のスマートカードデーモンを再有効化します(PC/SC backend 用, sudo が必要)…"
+  local svc
+  for svc in com.apple.ifdreader com.apple.usbsmartcardreaderd; do
+    sudo launchctl enable   "system/$svc" 2>/dev/null || true
+    sudo launchctl bootstrap system /System/Library/LaunchDaemons/"$svc".plist 2>/dev/null || true
+  done
+  ok "完了。リーダーを一度抜き差ししてから PC/SC backend(NFC_BACKEND=pcsc)をお試しください。"
+  cat <<EOF
+${DIM}再び無効化(libnfc backend 用)に戻すには:
+  ./write-url.sh --fix-reader${RST}
+EOF
 }
 
 # --- macOS リーダー解放 ------------------------------------------------------
@@ -1261,18 +1308,59 @@ if [ "$SELF_TEST" -eq 1 ]; then
   exit $?
 fi
 
+# --enable-reader: スマートカードデーモン再有効化だけ行って終了(PC/SC backend 用)
+# backend に依らずデーモン操作なので、pcsc ルーティングより前に処理する。
+if [ "$ENABLE_READER" -eq 1 ]; then
+  enable_reader
+  exit 0
+fi
+
+# --fix-reader: リーダー解放だけ行って終了(libnfc backend 用のデーモン操作)
+# backend に依らずデーモン操作なので、pcsc ルーティングより前に処理する。
+if [ "$FIX_READER" -eq 1 ]; then
+  fix_reader
+  exit 0
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  NFC_BACKEND=pcsc: reader/detect/read/write/format/print-ndef を nfc-core.py へ委譲。
+#  libnfc(既定)は下のとおり従来どおり。pcsc は opt-in・dark(何も既定を変えない)。
+# ═════════════════════════════════════════════════════════════════════════════
+if [ "$NFC_BACKEND" = "pcsc" ]; then
+  # --self-test は bash 側のビルダを検証するもの(pcsc でも下の従来分岐で実行)。
+  if [ "$SELF_TEST" -ne 1 ]; then
+    if [ "$PRINT_NDEF" -eq 1 ]; then
+      # nfc-core.py は env TARGET_URL を読む。stdout 契約は同一。
+      TARGET_URL="$TARGET_URL" pcsc_backend --print-ndef
+      exit $?
+    fi
+    if [ "$DO_DETECT" -eq 1 ]; then
+      pcsc_backend --detect
+      exit $?
+    fi
+    if [ "$DO_READ" -eq 1 ]; then
+      pcsc_backend --read
+      exit $?
+    fi
+    # 通常の書き込み(main)。--format 指定なら format+write を内包する --format へ。
+    info "書き込む URL：${TARGET_URL}"
+    if [ "$DO_FORMAT" -eq 1 ]; then
+      pcsc_backend --format "$TARGET_URL"
+    else
+      pcsc_backend --write "$TARGET_URL"
+    fi
+    rc=$?
+    if [ "$rc" -eq 0 ]; then sound_ok; else sound_ng; fi
+    exit "$rc"
+  fi
+fi
+
 # --print-ndef: ハードウェア不要。生成される NDEF バイト列だけ表示して終了
 if [ "$PRINT_NDEF" -eq 1 ]; then
   require_cmd xxd || die "xxd が見つかりません。"
   build_ndef_message "$TARGET_URL" "$TMP_WORK/ndef.bin"
   printf 'URL : %s\n' "$TARGET_URL"
   printf 'NDEF: '; xxd -p "$TMP_WORK/ndef.bin" | tr -d '\n'; echo
-  exit 0
-fi
-
-# --fix-reader: リーダー解放だけ行って終了
-if [ "$FIX_READER" -eq 1 ]; then
-  fix_reader
   exit 0
 fi
 

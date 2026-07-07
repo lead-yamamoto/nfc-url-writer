@@ -358,7 +358,11 @@ final class AppModel: ObservableObject {
                     self.playCompletionSound(success: ok)
                 }
                 // トースト表示
-                if action == "fix" {
+                // 非対応リーダー×タグの組合せ（INCOMPAT: 行）が出力にあれば、
+                // その日本語ガイダンスを赤トーストで最優先に表示する。
+                if let incompat = AppModel.incompatMessage(from: result.1) {
+                    self.showToast(incompat, kind: 3)
+                } else if action == "fix" {
                     self.showToast(ok ? "リーダー解放を実行しました" : "リーダー解放に失敗しました",
                                    kind: ok ? 2 : 3)
                 } else if action == "read" {
@@ -462,6 +466,24 @@ final class AppModel: ObservableObject {
             }
         }
         return "ログを確認してください"
+    }
+
+    /// 出力から "INCOMPAT: <tagtype>|<日本語説明>" 行を探し、日本語ガイダンスを返す。
+    /// 非対応リーダー×タグ組合せ（PC/SC backend が出力）を赤トーストで示すために使う。
+    /// 見つからなければ nil。
+    static func incompatMessage(from output: String) -> String? {
+        for raw in output.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("INCOMPAT:") else { continue }
+            let body = line.dropFirst("INCOMPAT:".count).trimmingCharacters(in: .whitespaces)
+            // <tagtype>|<日本語説明> の '|' 以降を採用。無ければ本文全体。
+            if let bar = body.firstIndex(of: "|") {
+                let msg = body[body.index(after: bar)...].trimmingCharacters(in: .whitespaces)
+                if !msg.isEmpty { return msg }
+            }
+            if !body.isEmpty { return String(body) }
+        }
+        return nil
     }
 
     /// 失敗時の出力を検査し、既知のシグネチャに一致したら日本語のヒント行を追記する。
