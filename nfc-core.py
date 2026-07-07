@@ -573,33 +573,79 @@ def sw_ok(resp):
 # ═════════════════════════════════════════════════════════════════════════════
 #
 # リーダー名から family を判定し、capability matrix を駆動する。
-#   nxp    : ACR/ACS/PN53x 系(NXP チップ)。Crypto1 対応 = MIFARE Classic 可。
-#   felica : Sony/FeliCa/PaSoRi/RC-S 系。Type-A 系の書き込みは非対応。
-#   generic: それ以外の PC/SC リーダー。Type-A APDU は通せる想定だが Classic 不可。
+#
+#   nxp     : PN53x 系(NXP PN531/532/533 チップ)を積む CCID リーダー。
+#             ACR122U / ACR122 / SCL3711 / Touchatag / uTrust 3700 (PN533版) 等。
+#             ★ MIFARE Classic の Crypto1 認証(FF 82 / FF 86 疑似APDU)を実装するのは
+#               この family のみ。Type2/Type4 も当然扱える。
+#   generic : PN53x 以外の Type-A 対応 PC/SC(CCID)リーダー。
+#             ACR1252 / ACR1255 / OMNIKEY 5x22 / PC Twin / Identiv 3700 F 等。
+#             ISO14443A 標準 APDU で NFC Forum Type2/Type4 は読み書きできるが、
+#             Crypto1 は非実装なので MIFARE Classic は扱えない。
+#   felica  : Sony FeliCa 系(RC-S300/RC-S380/PaSoRi/SONY Felica Port)。
+#             Type-A の Classic/Type2/Type4 は扱えず、FeliCa は検出のみ(書込は Phase5)。
+#   unknown : 上記いずれにも当てはまらない未分類リーダー。安全側に倒す。
+#
+# 判定は「大文字化した名前への部分一致(substring)」で、ベンダ接頭辞に強くする。
 
 READER_NXP = "nxp"
-READER_FELICA = "felica"
 READER_GENERIC = "generic"
+READER_FELICA = "felica"
+READER_UNKNOWN = "unknown"
+
+
+# FeliCa 系(Sony)。Type-A の Classic/Type2/Type4 は不可、FeliCa は検出のみ。
+# NOTE: これらは最優先で判定する(Sony 製品名は他の family キーワードと衝突しないが、
+#       "FELICA PORT" 等を確実に felica に寄せるため先頭で弾く)。
+_READER_KW_FELICA = (
+    "FELICA", "PASORI", "RC-S300", "RC-S380", "RC-S", "SONY FELICA",
+)
+
+# PN53x 系(NXP)。MIFARE Classic Crypto1 を実装できる唯一の family。
+# ACR122U/ACR122/ACR1222 は PN532、SCL3711/Touchatag/一部 uTrust 3700 は PN533。
+_READER_KW_NXP = (
+    "ACR122", "ACR1222", "ACR1281",
+    "SCL3711", "SCL011",           # SCM Microsystems PN533 系
+    "TOUCHATAG",                   # Touchatag(旧 Tikitag)= PN532
+    "PN531", "PN532", "PN533", "PN53X", "PN53",
+)
+
+# 汎用 Type-A CCID(PN53x 以外)。Type2/Type4 可、Classic 不可。
+# ACR1252/ACR1255、Identiv/SCM uTrust 3700 F、HID OMNIKEY 5x22、Gemalto/Thales PC Twin。
+_READER_KW_GENERIC = (
+    "ACR1252", "ACR1255", "ACR1251", "ACR1283", "ACR1311",
+    "UTRUST 3700", "µTRUST 3700", "IDENTIV", "UTRUST", "µTRUST",
+    "OMNIKEY", "OMNIKEY 5022", "OMNIKEY 5122", "OMNIKEY 5422",
+    "PC TWIN", "GEMALTO", "THALES", "GEMPC",
+    "CONTACTLESS", "CCID",         # 汎用非接触 CCID の総称
+)
 
 
 def classify_reader(name):
-    """リーダー名(str) -> family トークン。"""
-    u = name.upper()
-    # Sony/FeliCa 系を先に弾く(名前に ACS を含む Sony 製もあり得るが RC-S 優先)。
-    for kw in ("SONY", "FELICA", "PASORI", "RC-S"):
+    """リーダー名(str) -> family トークン。大文字化 + 部分一致(substring)。"""
+    u = (name or "").upper()
+    # 1) FeliCa 系を最優先で弾く(Sony 製品名)。
+    for kw in _READER_KW_FELICA:
         if kw in u:
             return READER_FELICA
-    for kw in ("ACR", "ACS", "PN53", "PN533", "PN532"):
+    # 2) PN53x 系(Crypto1 可)。汎用より先に判定して ACR1252 等と取り違えない。
+    for kw in _READER_KW_NXP:
         if kw in u:
             return READER_NXP
-    return READER_GENERIC
+    # 3) 汎用 Type-A CCID(Classic 不可、Type2/Type4 可)。
+    for kw in _READER_KW_GENERIC:
+        if kw in u:
+            return READER_GENERIC
+    # 4) それ以外は未分類。
+    return READER_UNKNOWN
 
 
 def reader_family_label(family):
     return {
-        READER_NXP: "NXP系(ACR122U など)",
-        READER_FELICA: "Sony/FeliCa系(RC-S300/PaSoRi)",
-        READER_GENERIC: "汎用 PC/SC リーダー",
+        READER_NXP: "PN53x系(ACR122U など。MIFARE Classic 対応)",
+        READER_GENERIC: "汎用 Type-A リーダー(NTAG/Type2・Type4。Classic 非対応)",
+        READER_FELICA: "Sony/FeliCa系(RC-S300/RC-S380/PaSoRi。検出のみ)",
+        READER_UNKNOWN: "不明なリーダー",
     }.get(family, "不明なリーダー")
 
 
@@ -709,10 +755,10 @@ def detect_tag_live(card):
     uid_hex = uid.hex()
 
     # Classic 認証プローブ(非破壊: 読みも書きもしない、auth のみ)。
+    # NDEF フォーマット済み Classic は sector0=A0A1(MAD)/data=D3F7 を使い FF では
+    # auth できないため、read/write 経路と同じ鍵候補(_CLASSIC_MAD_KEYS)を試す。
     try:
-        card.transmit(apdu_load_key(0x00, KEY_FFFFFF))
-        auth = card.transmit(apdu_auth(0x00, KEYTYPE_A, 0x00))
-        if sw_ok(auth):
+        if _auth_sector(card, 0, _CLASSIC_MAD_KEYS) is not None:
             return TAG_CLASSIC, uid_hex
     except PCSCError:
         pass
@@ -731,25 +777,53 @@ def detect_tag_live(card):
 #  SECTION 4: capability matrix(reader_family × tag_type)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-# データ駆動。値: "ok"(対応) / "no"(非対応) / "exp"(実験的)。
-# ルール(ARCH):
-#   MIFARE Classic は NXP 系必須(Crypto1)。
-#   FeliCa は書き込み非対応(全リーダー)。
-#   Type2/Type4 は Type-A APDU が通れば可(NXP/generic)。FeliCa リーダーでは不可。
+# データ駆動。値: "ok"(正式対応) / "exp"(実験的対応) / "no"(非対応)。
+# ルール(ARCH / Phase2):
+#   MIFARE Classic  … Crypto1 認証が要るので PN53x 系(nxp)でのみ可。
+#                     汎用 Type-A CCID(generic)/FeliCa/未分類では不可。
+#   Type2(NTAG等)  … ISO14443A 標準 APDU で読み書き。Type-A が通る nxp/generic で可。
+#   Type4(DESFire) … 同上(Type-A 標準 APDU)。nxp/generic で可(実装は Phase5 で本格化)。
+#   FeliCa          … NDEF 書き込みは全リーダーで非対応(検出のみ。Phase5 まで)。
+#   unknown リーダー … 素性不明。Type-A が通るとは限らないので安全側で "no"(試行させない)。
+#                     ただし Classic だけは「PN53x 以外は原理的に不可」と同じ扱いで "no"。
 
 CAPABILITY = {
-    #            classic type2  type4  felica
+    #                classic     type2       type4       felica
     READER_NXP:     {TAG_CLASSIC: "ok",  TAG_TYPE2: "exp", TAG_TYPE4: "exp", TAG_FELICA: "no"},
     READER_GENERIC: {TAG_CLASSIC: "no",  TAG_TYPE2: "exp", TAG_TYPE4: "exp", TAG_FELICA: "no"},
     READER_FELICA:  {TAG_CLASSIC: "no",  TAG_TYPE2: "no",  TAG_TYPE4: "no",  TAG_FELICA: "no"},
+    READER_UNKNOWN: {TAG_CLASSIC: "no",  TAG_TYPE2: "no",  TAG_TYPE4: "no",  TAG_FELICA: "no"},
 }
 
-# 非対応時に添える「必要なリーダー」説明(INCOMPAT: の日本語部分)。
+# 非対応時に添える説明(INCOMPAT: の日本語部分)。
+# 「なぜ扱えないか」「どんなリーダーが要るか」を、失敗したタグに合わせて具体的に述べる。
+# リーダー family ごとに文面を変えたいので (tag, family) の 2 段引きにする。
+#   _INCOMPAT_MSG[tag][family] があればそれを、無ければ _INCOMPAT_MSG[tag][None] を使う。
+
+# MIFARE Classic は Crypto1 認証が必須で PN53x 系リーダーだけが扱える、という核となる説明。
+_CLASSIC_WHY = ("MIFARE Classic は Crypto1 認証が必要で、"
+                "PN53x系リーダー(ACR122U など)でのみ扱えます。")
+
 _INCOMPAT_MSG = {
-    TAG_CLASSIC: "MIFARE Classic には NXP系チップのリーダー(ACR122U など)が必要です。Sony RC-S300/PaSoRi 等では扱えません。",
-    TAG_TYPE2:   "このタグ(NTAG/Type2)には Type-A 対応リーダー(ACR122U など)が必要です。FeliCa専用リーダーでは扱えません。",
-    TAG_TYPE4:   "このタグ(DESFire/Type4)には Type-A 対応リーダー(ACR122U など)が必要です。FeliCa専用リーダーでは扱えません。",
-    TAG_FELICA:  "FeliCa カードへの NDEF URL 書き込みには対応していません。NTAG213/215/216 か MIFARE Classic 1K をご利用ください。",
+    TAG_CLASSIC: {
+        READER_GENERIC: _CLASSIC_WHY + "お使いのリーダーは Type-A の NTAG/Type4 には対応しますが Classic は扱えません。",
+        READER_FELICA:  _CLASSIC_WHY + "Sony RC-S300/RC-S380/PaSoRi では扱えません。",
+        None:           _CLASSIC_WHY,
+    },
+    TAG_TYPE2: {
+        READER_FELICA: "NTAG/Type2 は ISO14443A(Type-A)対応リーダーが必要で、FeliCa専用リーダー(RC-S300 など)では扱えません。ACR122U 等をご利用ください。",
+        None:          "NTAG/Type2 を扱うには ISO14443A(Type-A)対応リーダーが必要です。ACR122U 等をご利用ください。",
+    },
+    TAG_TYPE4: {
+        READER_FELICA: "Type4(DESFire 等)は ISO14443A(Type-A)対応リーダーが必要で、FeliCa専用リーダー(RC-S300 など)では扱えません。ACR122U 等をご利用ください。",
+        None:          "Type4(DESFire 等)を扱うには ISO14443A(Type-A)対応リーダーが必要です。ACR122U 等をご利用ください。",
+    },
+    TAG_FELICA: {
+        None: "FeliCa カードへの NDEF URL 書き込みには対応していません。NTAG213/215/216 か MIFARE Classic 1K をご利用ください。",
+    },
+    TAG_UNKNOWN: {
+        None: "カードの種類を判別できませんでした。対応カード(NTAG/MIFARE Classic 1K)を、対応リーダー(ACR122U など)でお試しください。",
+    },
 }
 
 
@@ -758,14 +832,23 @@ def capability(reader_family, tag_type):
     return CAPABILITY.get(reader_family, {}).get(tag_type, "no")
 
 
-def incompat_message(tag_type):
-    """INCOMPAT: 行の日本語説明部分を返す。"""
-    return _INCOMPAT_MSG.get(tag_type, "このリーダーでは扱えないカードです。")
+def incompat_message(tag_type, reader_family=None):
+    """INCOMPAT: 行の日本語説明部分を返す。
+
+    リーダー family が分かる場合は、それに合わせて「なぜ/何が要るか」を具体化する。
+    family 別の文面が無ければ、その tag の汎用文面(None キー)を返す。
+    """
+    per_tag = _INCOMPAT_MSG.get(tag_type)
+    if not per_tag:
+        return "このリーダーでは扱えないカードです。"
+    if reader_family in per_tag:
+        return per_tag[reader_family]
+    return per_tag.get(None, "このリーダーでは扱えないカードです。")
 
 
-def emit_incompat(tag_type):
+def emit_incompat(tag_type, reader_family=None):
     """出力コントラクト: INCOMPAT: <tagtype>|<日本語>。"""
-    print("INCOMPAT: %s|%s" % (tag_type, incompat_message(tag_type)))
+    print("INCOMPAT: %s|%s" % (tag_type, incompat_message(tag_type, reader_family)))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -776,9 +859,10 @@ def emit_incompat(tag_type):
 # trailer を書くとキーが変わるため最後に書く。認証キーは既存 NDEF カードなら D3F7/A0A1、
 # 工場出荷は FF。ここでは両方を順に試すヘルパを用意する。
 
-# 認証で試すキー候補(既存 NDEF -> 工場出荷 の順)。
-_CLASSIC_DATA_KEYS = [KEY_NDEF_A, KEY_FFFFFF]
-_CLASSIC_MAD_KEYS = [KEY_MAD_A, KEY_FFFFFF]
+# 認証で試すキー候補(既存 NDEF -> MAD -> 工場出荷 の順)。
+# データセクタは通常 D3F7 だが、一部書き込みツールは A0A1 を流用するため両方試す。
+_CLASSIC_DATA_KEYS = [KEY_NDEF_A, KEY_MAD_A, KEY_FFFFFF]
+_CLASSIC_MAD_KEYS = [KEY_MAD_A, KEY_NDEF_A, KEY_FFFFFF]
 
 
 def _auth_sector(card, sector, keys):
@@ -820,19 +904,65 @@ def classic_write_image(card, blocks):
             raise PCSCError(SCARD_E_NO_SMARTCARD, "write trailer %d" % tb)
 
 
+def parse_mad_ndef_sectors(mad_bytes):
+    """MAD 本体(blk1+blk2 = 32バイト)から NDEF(AID=03 E1)のセクタ番号 list を返す。
+
+    mad_bytes: [CRC, Info, AID_s1(2), AID_s2(2), ... AID_s15(2)](32バイト)。
+    NDEF AID(03 E1)が入っているセクタ番号(1..15)を昇順で返す。空なら []。
+    """
+    sectors = []
+    if len(mad_bytes) < 32:
+        return sectors
+    for s in range(1, 16):
+        pos = 2 * s
+        if mad_bytes[pos:pos + 2] == MAD_AID_NDEF:
+            sectors.append(s)
+    return sectors
+
+
 def classic_read_ndef(card):
-    """MIFARE Classic からデータセクタを読み、NDEF を復元して返す(bytes or None)。"""
+    """MIFARE Classic からデータセクタを読み、NDEF を復元して返す(bytes or None)。
+
+    手順(NFC Forum / AN10787 準拠):
+      1) sector0 を MAD キー(A0A1 -> D3F7 -> FF)で認証し、MAD(blk1-2)を読む。
+      2) MAD の AID(03 E1)で NDEF セクタ番号を特定する。
+      3) MAD が読めない/AID が無い場合はフォールバックで sector1..15 を走査する。
+      4) 各 NDEF セクタを D3F7 -> A0A1 -> FF の順で認証し、3データブロック
+         (trailer=blk3 は除く)を読み、TLV に連結する。
+      5) TLV(03 <len> ... FE)を復元して NDEF を取り出す。
+    """
+    # --- 1) MAD を読み、NDEF セクタを特定 ---
+    ndef_sectors = []
+    mad_key = _auth_sector(card, 0, _CLASSIC_MAD_KEYS)
+    if mad_key is not None:
+        mad = bytearray()
+        for d in (1, 2):  # sector0 blk1, blk2 = MAD 本体
+            resp = card.transmit(apdu_read(d, 16))
+            if not sw_ok(resp):
+                mad = bytearray()
+                break
+            mad += resp[:-2]
+        if len(mad) >= 32:
+            ndef_sectors = parse_mad_ndef_sectors(bytes(mad))
+
+    # --- 3) フォールバック: MAD が使えなければ 1..15 を総当り ---
+    if not ndef_sectors:
+        ndef_sectors = list(range(1, 16))
+
+    # --- 4) NDEF セクタからデータブロックを連結 ---
     tlv = bytearray()
-    for sector in range(1, 16):
+    for sector in ndef_sectors:
         key = _auth_sector(card, sector, _CLASSIC_DATA_KEYS)
         if key is None:
-            break
+            continue  # このセクタは読めない -> スキップ(全体は止めない)
         base = sector * 4
-        for d in range(3):
+        for d in range(3):  # データブロックのみ(blk3=trailer は除外)
             resp = card.transmit(apdu_read(base + d, 16))
             if not sw_ok(resp):
                 break
             tlv += resp[:-2]
+
+    # --- 5) TLV -> NDEF ---
     return extract_type2_ndef(bytes(tlv))
 
 
@@ -890,11 +1020,25 @@ def type2_read_ndef(card):
 #  ライブ経路の共通: リーダー選択 + タグ検出 + capability
 # ═════════════════════════════════════════════════════════════════════════════
 
+# リーダー選択の優先度(小さいほど優先)。
+# PN53x(Classic 可)> 汎用 Type-A(Type2/Type4 可)> 未分類 > FeliCa(検出のみ)。
+_READER_RANK = {
+    READER_NXP: 0,
+    READER_GENERIC: 1,
+    READER_UNKNOWN: 2,
+    READER_FELICA: 3,
+}
+
+
 def _pick_reader(names):
-    """NXP 系を最優先で 1 台選ぶ。無ければ先頭。返り値 (name, family) or (None, None)。"""
+    """最も対応範囲の広いリーダーを 1 台選ぶ。返り値 (name, family) or (None, None)。
+
+    PN53x を最優先(MIFARE Classic 可)、次いで汎用 Type-A(Type2/Type4 可)、
+    未分類、最後に FeliCa(検出のみ)の順に選ぶ。同順位なら列挙順を保つ。
+    """
     if not names:
         return None, None
-    ranked = sorted(names, key=lambda n: 0 if classify_reader(n) == READER_NXP else 1)
+    ranked = sorted(names, key=lambda n: _READER_RANK.get(classify_reader(n), 9))
     name = ranked[0]
     return name, classify_reader(name)
 
@@ -967,8 +1111,8 @@ def cmd_detect():
 
         cap = capability(family, tag_type)
         if cap == "no":
-            emit_incompat(tag_type)
-            warn(incompat_message(tag_type))
+            emit_incompat(tag_type, family)
+            warn(incompat_message(tag_type, family))
         else:
             step("カードを検出: %s(%s)" % (tag_type, "正式対応" if cap == "ok" else "実験的対応"))
         return 0
@@ -1019,8 +1163,8 @@ def cmd_read():
     try:
         cap = capability(family, tag_type)
         if cap == "no":
-            emit_incompat(tag_type)
-            fail(incompat_message(tag_type))
+            emit_incompat(tag_type, family)
+            fail(incompat_message(tag_type, family))
             return 1
         step("カードを読み取っています…")
         if tag_type == TAG_CLASSIC:
@@ -1065,8 +1209,8 @@ def cmd_write(url):
     try:
         cap = capability(family, tag_type)
         if cap == "no":
-            emit_incompat(tag_type)
-            fail(incompat_message(tag_type))
+            emit_incompat(tag_type, family)
+            fail(incompat_message(tag_type, family))
             return 1
         if cap == "exp":
             warn("このカードへの書き込みは実験的機能です。")
@@ -1217,18 +1361,94 @@ def run_self_test():
                     0x00, 0x00, 0x00, 0x00, 0x68])
     check("ATR Ultralight => type2", classify_tag_from_atr(atr_ul), TAG_TYPE2)
 
-    check("reader ACR122U => nxp", classify_reader("ACS ACR122U PICC Interface"), READER_NXP)
-    check("reader PaSoRi => felica", classify_reader("Sony FeliCa Port/PaSoRi 3.0"), READER_FELICA)
-    check("reader RC-S300 => felica", classify_reader("SONY RC-S300"), READER_FELICA)
-    check("reader generic", classify_reader("Generic USB CCID Reader"), READER_GENERIC)
+    # --- reader 名 -> family(実機で現れる PC/SC 名を網羅)---
+    # 実際の PCSC.framework は "<vendor> <model> [interface] NN" 形式の名前を返す。
+    _READER_CASES = [
+        # PN53x 系(MIFARE Classic 可)
+        ("ACS ACR122U PICC Interface",           READER_NXP),
+        ("ACS ACR122U",                          READER_NXP),
+        ("ACR122",                               READER_NXP),
+        ("ACS ACR1222L Dual Reader PICC",        READER_NXP),
+        ("ACS ACR1281U-C1 PICC",                 READER_NXP),
+        ("SCM Microsystems Inc. SCL3711 reader", READER_NXP),
+        ("Touchatag USB reader 00 00",           READER_NXP),
+        ("NXP PN532 contactless",                READER_NXP),  # PN532 が最優先で nxp
+        ("Some Vendor PN533 board",              READER_NXP),
+        ("Generic PN53x device",                 READER_NXP),
+        # 汎用 Type-A CCID(Classic 不可 / Type2・Type4 可)
+        ("ACS ACR1252U USB NFC Reader",          READER_GENERIC),
+        ("ACS ACR1255U-J1 PICC",                 READER_GENERIC),
+        ("Identiv uTrust 3700 F CL Reader",      READER_GENERIC),
+        ("uTrust 3700 F",                        READER_GENERIC),
+        ("HID Global OMNIKEY 5022 Smartcard",    READER_GENERIC),
+        ("HID OMNIKEY 5422",                     READER_GENERIC),
+        ("Gemalto PC Twin Reader",               READER_GENERIC),
+        ("Thales PC Twin Reader 00",             READER_GENERIC),
+        ("Generic USB Contactless CCID Reader",  READER_GENERIC),
+        # FeliCa 系(検出のみ)
+        ("Sony FeliCa Port/PaSoRi 3.0",          READER_FELICA),
+        ("SONY RC-S300",                         READER_FELICA),
+        ("Sony RC-S380/P",                       READER_FELICA),
+        ("SONY FeliCa RC-S380",                  READER_FELICA),
+        ("SONY Felica Port RC-S330",             READER_FELICA),
+        ("PaSoRi RC-S380",                       READER_FELICA),
+        # 未分類
+        ("Foobar Widget 3000",                   READER_UNKNOWN),
+        ("Unknown Smartcard Reader",             READER_UNKNOWN),
+        ("",                                     READER_UNKNOWN),
+    ]
+    for nm, fam in _READER_CASES:
+        check("reader %r => %s" % (nm, fam), classify_reader(nm), fam)
+    # 大小文字を無視する(substring, case-insensitive)
+    check("reader 小文字 acr122u => nxp", classify_reader("acs acr122u picc"), READER_NXP)
+    check("reader 小文字 rc-s300 => felica", classify_reader("sony rc-s300"), READER_FELICA)
+    # ラベルが family ごとに用意されていること(空でない)
+    for fam in (READER_NXP, READER_GENERIC, READER_FELICA, READER_UNKNOWN):
+        check("reader label %s 非空" % fam, bool(reader_family_label(fam)), True)
 
-    # --- capability matrix ---
-    check("cap nxp×classic=ok", capability(READER_NXP, TAG_CLASSIC), "ok")
-    check("cap generic×classic=no", capability(READER_GENERIC, TAG_CLASSIC), "no")
-    check("cap felica×type2=no", capability(READER_FELICA, TAG_TYPE2), "no")
-    check("cap nxp×type2=exp", capability(READER_NXP, TAG_TYPE2), "exp")
-    check("cap nxp×felica=no", capability(READER_NXP, TAG_FELICA), "no")
-    check("cap felica×felica=no", capability(READER_FELICA, TAG_FELICA), "no")
+    # --- capability matrix(family × tag を全網羅)---
+    # 期待表: MIFARE Classic は PN53x(nxp)のみ。Type2/Type4 は nxp/generic。FeliCa は全滅。
+    _CAP_CASES = {
+        (READER_NXP,     TAG_CLASSIC): "ok",  (READER_NXP,     TAG_TYPE2): "exp",
+        (READER_NXP,     TAG_TYPE4):   "exp", (READER_NXP,     TAG_FELICA): "no",
+        (READER_GENERIC, TAG_CLASSIC): "no",  (READER_GENERIC, TAG_TYPE2): "exp",
+        (READER_GENERIC, TAG_TYPE4):   "exp", (READER_GENERIC, TAG_FELICA): "no",
+        (READER_FELICA,  TAG_CLASSIC): "no",  (READER_FELICA,  TAG_TYPE2): "no",
+        (READER_FELICA,  TAG_TYPE4):   "no",  (READER_FELICA,  TAG_FELICA): "no",
+        (READER_UNKNOWN, TAG_CLASSIC): "no",  (READER_UNKNOWN, TAG_TYPE2): "no",
+        (READER_UNKNOWN, TAG_TYPE4):   "no",  (READER_UNKNOWN, TAG_FELICA): "no",
+    }
+    for (fam, tag), exp in _CAP_CASES.items():
+        check("cap %s×%s=%s" % (fam, tag, exp), capability(fam, tag), exp)
+    # 核となるルール: MIFARE Classic は PN53x 系だけが "ok"。
+    check("Classic は nxp のみ ok",
+          [f for f in (READER_NXP, READER_GENERIC, READER_FELICA, READER_UNKNOWN)
+           if capability(f, TAG_CLASSIC) == "ok"],
+          [READER_NXP])
+
+    # --- INCOMPAT メッセージ(family に応じて WHY/WHAT を出し分ける)---
+    # Classic を汎用/FeliCa リーダーで → Crypto1/PN53x の説明が入る。
+    msg_cg = incompat_message(TAG_CLASSIC, READER_GENERIC)
+    check("INCOMPAT classic×generic に Crypto1", "Crypto1" in msg_cg, True)
+    check("INCOMPAT classic×generic に PN53x", "PN53x" in msg_cg, True)
+    msg_cf = incompat_message(TAG_CLASSIC, READER_FELICA)
+    check("INCOMPAT classic×felica に PaSoRi 言及", "PaSoRi" in msg_cf, True)
+    # Type2/Type4 を FeliCa リーダーで → Type-A が要る旨。
+    check("INCOMPAT type2×felica に Type-A", "Type-A" in incompat_message(TAG_TYPE2, READER_FELICA), True)
+    check("INCOMPAT type4×felica に Type-A", "Type-A" in incompat_message(TAG_TYPE4, READER_FELICA), True)
+    # FeliCa タグは全リーダーで書込非対応の案内。
+    check("INCOMPAT felica に NTAG 案内", "NTAG" in incompat_message(TAG_FELICA), True)
+    # family 未指定でも汎用文面が返る(空でない)。
+    for tag in (TAG_CLASSIC, TAG_TYPE2, TAG_TYPE4, TAG_FELICA, TAG_UNKNOWN):
+        check("INCOMPAT %s 汎用文面 非空" % tag, bool(incompat_message(tag)), True)
+
+    # --- リーダー選択の優先度(_pick_reader)---
+    pick_name, pick_fam = _pick_reader(
+        ["SONY RC-S300", "Generic USB Contactless CCID Reader", "ACS ACR122U"])
+    check("_pick_reader は PN53x を最優先", pick_fam, READER_NXP)
+    pick_name2, pick_fam2 = _pick_reader(["SONY RC-S300", "ACS ACR1252U"])
+    check("_pick_reader 汎用 > FeliCa", pick_fam2, READER_GENERIC)
+    check("_pick_reader 空は (None,None)", _pick_reader([]), (None, None))
 
     # --- APDU ビルダ(class 0xFF)---
     check("APDU get UID", apdu_get_uid().hex(), "ffca000000")
@@ -1238,6 +1458,60 @@ def run_self_test():
     check("APDU write block4", apdu_write(0x04, bytes(16)).hex(), "ffd6000410" + "00" * 16)
     check("SW 9000 => ok", sw_ok(bytes([0x00, 0x90, 0x00])), True)
     check("SW 6300 => not ok", sw_ok(bytes([0x63, 0x00])), False)
+
+    # --- detect_tag_live: 鍵候補プローブ(ハードウェア不要のフェイクカード)---
+    SW_OK = bytes([0x90, 0x00])
+    SW_FAIL = bytes([0x63, 0x00])
+
+    class _FakeCard(object):
+        """.transmit(apdu) だけを持つ最小のフェイク。
+
+        auth_ok(key6) が True を返す KeyA 認証だけ 9000、その他は 6300。
+        page3_ok=True なら apdu_read(block=3) に 9000(Type2 相当)。
+        """
+        def __init__(self, uid, auth_ok, page3_ok=False):
+            self.uid = bytes(uid)
+            self.auth_ok = auth_ok
+            self.page3_ok = page3_ok
+            self.loaded_key = None
+
+        def transmit(self, apdu):
+            apdu = bytes(apdu)
+            if apdu == apdu_get_uid():                       # FF CA 00 00 00
+                return self.uid + SW_OK
+            if apdu[:4] == bytes([0xFF, 0x82, 0x00, 0x00]):  # load key -> slot0
+                self.loaded_key = apdu[5:11]
+                return SW_OK
+            if apdu[:2] == bytes([0xFF, 0x86]):              # general auth
+                if self.loaded_key is not None and self.auth_ok(self.loaded_key):
+                    return SW_OK
+                return SW_FAIL
+            if apdu[:2] == bytes([0xFF, 0xB0]):              # read binary
+                if self.page3_ok and apdu[3] == 0x03:
+                    return bytes(16) + SW_OK
+                return SW_FAIL
+            return SW_FAIL
+
+    # NDEF フォーマット済み Classic: FF は失敗、A0A1(MAD)/D3F7 で成功 -> classic
+    fmt_classic = _FakeCard(
+        bytes([0x16, 0x96, 0x56, 0x80]),
+        lambda k: k in (KEY_MAD_A, KEY_NDEF_A))
+    check("detect_tag_live: NDEF済Classic => classic",
+          detect_tag_live(fmt_classic)[0], TAG_CLASSIC)
+
+    # 未フォーマット(工場出荷)Classic: FF で auth 成功 -> classic
+    blank_classic = _FakeCard(
+        bytes([0x04, 0x11, 0x22, 0x33]),
+        lambda k: k == KEY_FFFFFF)
+    check("detect_tag_live: 出荷時Classic => classic",
+          detect_tag_live(blank_classic)[0], TAG_CLASSIC)
+
+    # Type2 (NTAG): auth は全て失敗、page3 の読取りだけ成功 -> type2
+    type2 = _FakeCard(
+        bytes([0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
+        lambda k: False, page3_ok=True)
+    check("detect_tag_live: NTAG => type2",
+          detect_tag_live(type2)[0], TAG_TYPE2)
 
     print()
     if fails == 0:
