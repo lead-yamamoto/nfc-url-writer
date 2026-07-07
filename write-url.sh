@@ -38,7 +38,16 @@ LOCAL_BIN="$SCRIPT_DIR/bin"               # 自前ビルドしたツールの置
 BACKUP_DIR="${NFC_BACKUP_DIR:-$SCRIPT_DIR/backups}"  # バックアップ(.mfd)の保存先(NFC_BACKUP_DIR で上書き可)
 LIBFREEFARE_REF="libfreefare-0.4.0"       # フォールバックビルド時の参照タグ(brew版に合わせる)
 NDEF_TOOLS=(mifare-classic-format mifare-classic-write-ndef mifare-classic-read-ndef)
-BEEP_BIN="$LOCAL_BIN/acr122-beep"         # ACR122U ブザー制御ヘルパ(任意・libusb 必要)
+# ACR122U ブザー制御ヘルパ(任意・libusb 必要)の場所を解決する。
+#   ・通常のリポジトリ実行時: ./bin/acr122-beep
+#   ・.app にバンドルされた時: Contents/Resources/acr122-beep(スクリプトと同じ階層)
+# build-app.sh が prebuilt バイナリを Resources 直下へコピーするため、
+# bin/ が無いバンドル環境でもスクリプトの隣を探して見つけられるようにする。
+if [ -x "$LOCAL_BIN/acr122-beep" ]; then
+  BEEP_BIN="$LOCAL_BIN/acr122-beep"
+else
+  BEEP_BIN="$SCRIPT_DIR/acr122-beep"      # バンドル時(Resources 直下)
+fi
 
 # リトライ設定(他の Mac でリーダー掴み合いにより数回失敗する問題への対策)
 RETRY_MAX="${NFC_RETRY_MAX:-4}"           # 最大試行回数

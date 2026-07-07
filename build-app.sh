@@ -62,8 +62,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>$APP_NAME</string>
   <key>CFBundleIdentifier</key><string>com.local.nfcurlwriter</string>
   <key>CFBundleExecutable</key><string>$BIN_NAME</string>
-  <key>CFBundleVersion</key><string>0.2.0</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>0.3.0</string>
+  <key>CFBundleShortVersionString</key><string>0.3.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>LSMinimumSystemVersion</key><string>$MIN</string>
@@ -78,6 +78,27 @@ echo "==> スクリプト・アイコンを同梱"
 cp write-url.sh build-tools.sh "$APP/Contents/Resources/"
 chmod +x "$APP/Contents/Resources/"*.sh
 [ -f AppIcon.icns ] && cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+
+# ACR122U ブザー制御ヘルパ（任意）。事前ビルド済みの ./bin/acr122-beep があれば
+# Resources 直下へ同梱する。write-url.sh はバンドル時に $SCRIPT_DIR/acr122-beep
+# （= Resources 直下）を探して見つける。バンドルの Resources は読み取り専用/
+# 検疫されるため、実行時ビルドは当てにせず、ここで prebuilt を入れておく。
+if [ -x bin/acr122-beep ]; then
+  cp bin/acr122-beep "$APP/Contents/Resources/acr122-beep"
+  chmod +x "$APP/Contents/Resources/acr122-beep"
+  if arches_out="$(lipo -archs bin/acr122-beep 2>/dev/null)"; then
+    echo "    acr122-beep を同梱（$arches_out）"
+    case "$arches_out" in
+      *arm64*x86_64*|*x86_64*arm64*) : ;;  # universal
+      *) echo "    ![注意] acr122-beep は $arches_out 単体です。他アーキテクチャの Mac では"
+         echo "            リーダー本体のブザーは鳴りません（Mac スピーカーの afplay は動作します）。" ;;
+    esac
+  fi
+else
+  echo "    ![注意] bin/acr122-beep がありません → リーダーブザーは同梱しません"
+  echo "            （Mac 本体スピーカーの効果音 afplay は動作します）。"
+  echo "            事前ビルドするには: ./build-tools.sh"
+fi
 
 echo "==> アドホック署名（ローカル起動用。配布先では右クリック→開く が必要）"
 codesign --force --deep --sign - "$APP" 2>/dev/null || echo "    codesign は省略（未署名）"
