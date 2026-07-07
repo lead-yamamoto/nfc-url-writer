@@ -92,10 +92,12 @@ The tool auto-detects the tag type from its SAK (or FeliCa signaling) on every r
 
 ### Easiest: the app
 
-1. Open the **[latest release](https://github.com/lead-yamamoto/nfc-url-writer/releases/latest)** and download **`NFC-URL-Writer-macOS.zip`** from the **Assets** section — **not** the "Source code" archive (that's source only, no app). Unzip it to get `NFC URL Writer.app`. (Or [build from source](#building-from-source).)
-2. **First launch:** the app is unsigned, so macOS blocks it once. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** (macOS 15+); or run `xattr -dr com.apple.quarantine "NFC URL Writer.app"` in Terminal.
-3. If the NFC tools are missing, click **Install required tools** — the app runs `brew install libnfc libfreefare` for you.
-4. Plug in the ACR122U, place a card on it, type your URL, and click **Write**.
+1. Open the **[latest release](https://github.com/lead-yamamoto/nfc-url-writer/releases/latest)** and download **`NFC-URL-Writer.dmg`** from the **Assets** section — **not** the "Source code" archive (that's source only, no app).
+2. Open the `.dmg`, then **drag `NFC URL Writer.app` onto the `Applications` folder**. If a previous version is already installed, choose **Replace** — this overwrites the old copy in place and is what prevents the duplicate **"NFC URL Writer 2 / 3"** copies you get from repeatedly downloading the zip. Installing to **Applications** also avoids macOS **App Translocation** (running from a random Downloads folder). Then launch it from **Applications**.
+   - _Alternative:_ download **`NFC-URL-Writer-macOS.zip`** instead, unzip it to get `NFC URL Writer.app`, and move it into **Applications** yourself. (Or [build from source](#building-from-source).)
+3. **First launch:** the app is unsigned, so macOS blocks it once. **Right-click the app → Open** and confirm; or open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** (macOS 15+); or run `xattr -dr com.apple.quarantine "/Applications/NFC URL Writer.app"` in Terminal.
+4. If the NFC tools are missing, click **Install required tools** — the app runs `brew install libnfc libfreefare` for you.
+5. Plug in the ACR122U, place a card on it, type your URL, and click **Write**.
 
 ### Or install the dependencies yourself
 
