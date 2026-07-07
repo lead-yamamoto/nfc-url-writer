@@ -58,6 +58,11 @@ NFC_SOUND="${NFC_SOUND:-1}"
 SOUND_OK="/System/Library/Sounds/Glass.aiff"
 SOUND_NG="/System/Library/Sounds/Basso.aiff"
 
+# 詳細ログ(libnfc/libfreefare の生出力・16進ダンプ・UID/SAK 等)を表示するか。
+# 既定 0 = 表示しない(CLI もクリーン)。--verbose か NFC_VERBOSE=1 で表示。
+# アプリはこの詳細を「詳細ログ」トグル用に常にキャプチャするため NFC_VERBOSE=1 で起動する。
+NFC_VERBOSE="${NFC_VERBOSE:-0}"
+
 # 自前ビルドしたツールを優先的に探せるよう PATH の先頭に追加
 export PATH="$LOCAL_BIN:$PATH"
 
@@ -71,6 +76,20 @@ info() { printf '%s==>%s %s\n' "$BOLD" "$RST" "$*"; }
 ok()   { printf '%s ✓%s %s\n' "$GRN" "$RST" "$*"; }
 warn() { printf '%s ![注意]%s %s\n' "$YEL" "$RST" "$*" >&2; }
 err()  { printf '%s ✗%s %s\n' "$RED" "$RST" "$*" >&2; }
+
+# detail: 開発者向けの生ツール出力(nfc-list/mifare-*/nfc-mfclassic の出力、16進ダンプ、
+#   UID/SAK/ATQA 等)を「4スペース字下げ」で出す。NFC_VERBOSE=1 のときのみ表示し、
+#   既定(0)では完全に抑制する。字下げによりアプリ側で「詳細行」と機械的に判別できる。
+#   使い方1(引数): detail "文字列"
+#   使い方2(パイプ): some-tool 2>&1 | detail
+detail() {
+  [ "$NFC_VERBOSE" = "1" ] || { [ "$#" -gt 0 ] || cat >/dev/null; return 0; }
+  if [ "$#" -gt 0 ]; then
+    printf '%s\n' "$*" | sed 's/^/    /'
+  else
+    sed 's/^/    /'
+  fi
+}
 
 # --- 効果音ヘルパ ------------------------------------------------------------
 # afplay をバックグラウンド実行。afplay が無い/NFC_SOUND=0 の時は何もしない。
@@ -106,6 +125,7 @@ ${BOLD}write-url.sh${RST} — NFC タグに NDEF URL を書き込む (libnfc対�
   ./write-url.sh --read        カードに書かれている NDEF URL を読み取って表示
   ./write-url.sh --no-backup   書き込み前のバックアップを行わない
   ./write-url.sh --no-sound    成功/失敗の効果音を鳴らさない(NFC_SOUND=0 でも可)
+  ./write-url.sh --verbose     開発者向け: 生ツール出力(16進/UID/SAK 等)も表示(NFC_VERBOSE=1 でも可)
   ./write-url.sh --yes         確認プロンプトを省略する
   ./write-url.sh --help        このヘルプ
 
@@ -141,6 +161,7 @@ while [ $# -gt 0 ]; do
     --print-ndef) PRINT_NDEF=1 ;;
     --read)       DO_READ=1 ;;
     --detect)     DO_DETECT=1 ;;   # リーダー/カードの状態判定のみ(書き込まない)
+    --verbose|-v) NFC_VERBOSE=1 ;; # 開発者向け: 生ツール出力(16進/UID/SAK 等)も表示
     --self-test)  SELF_TEST=1 ;;   # 内部用: SAK 判定などの単体テスト
     -h|--help)    usage; exit 0 ;;
     *) err "不明なオプション: $1"; echo; usage; exit 2 ;;
@@ -515,13 +536,14 @@ ensure_ndef_tools() {
   local missing=0 t
   for t in "${NDEF_TOOLS[@]}"; do require_cmd "$t" || missing=1; done
   if [ "$missing" -eq 1 ]; then
-    warn "libfreefare の mifare-classic-* が PATH 上に無いため、ソースからビルドします…"
-    "$SCRIPT_DIR/build-tools.sh" || die "libfreefare ツールのビルドに失敗しました(README参照)。"
+    info "必要なツールを準備しています…"
+    detail "libfreefare の mifare-classic-* が PATH 上に無いため、ソースからビルドします…"
+    "$SCRIPT_DIR/build-tools.sh" || die "必要なツールの準備に失敗しました(README参照)。"
     hash -r
     for t in "${NDEF_TOOLS[@]}"; do
-      require_cmd "$t" || die "ビルド後も $t が見つかりません。"
+      require_cmd "$t" || die "準備後も必要なツールが見つかりません($t)。"
     done
-    ok "ローカルビルド済みツールを使用します: $LOCAL_BIN"
+    detail "ローカルビルド済みツールを使用します: $LOCAL_BIN"
   fi
 }
 
@@ -530,45 +552,58 @@ ensure_ndef_tools() {
 #   NFC_LIST_OUT にツール出力を保存し、TAG_TYPE/TAG_SAK/TAG_DEVICE を設定する。
 check_reader() {
   # まず対応リーダー(NXP系)を検出し、既定デバイスを固定する(安定性の要)。
-  info "接続中の NFC リーダーを確認し、対応リーダーを選択します…"
+  info "リーダーを確認しています…"
   select_reader || die "対応リーダーの選択に失敗しました。"
   if [ -n "$READER_NAME" ]; then
-    ok "使用リーダーを選択しました。"
-    # アプリが拾えるよう、機械可読な1行を出力する。
-    printf '使用リーダー: %s\n' "$READER_NAME"
+    ok "リーダーを確認しました（${READER_NAME}）"
+    # アプリが拾えるよう、機械可読な1行を出力する(字下げして詳細扱い=かんたんログには出さない)。
+    detail "使用リーダー: $READER_NAME"
     # 選択直後に ACR122U のブザー(カード検出時ピッ)を再有効化(失われた設定の復元)。
     reader_beep enable
   fi
 
-  info "nfc-list で NFC リーダー/カードの認識を確認します…"
   local out rc=0
   # nfc-list 自体をリトライ(他 Mac での掴み合いによる初回失敗対策)
-  retry_capture out "リーダー検出(nfc-list)" nfc-list || rc=$?
+  retry_capture out "カードの確認" nfc-list || rc=$?
   NFC_LIST_OUT="$out"
-  printf '%s\n' "$out" | sed 's/^/    /'
+  printf '%s\n' "$out" | detail
   if [ "$rc" -ne 0 ]; then
     maybe_reader_busy_hint "$out"
     reader_help
-    die "nfc-list の実行に失敗しました。"
+    die "リーダーの読み取りに失敗しました。ケーブルの抜き差しや「リーダー解放」をお試しください。"
   fi
 
   if printf '%s' "$out" | grep -qi 'ACR122'; then
-    ok "ACR122U を認識しました。"
+    : # リーダー名は既に上で通知済み。ここでは冗長な確認行を出さない。
   elif printf '%s' "$out" | grep -qiE 'NFC device.*opened'; then
-    warn "NFC デバイスは開けましたが ACR122U と断定できません。続行します。"
+    warn "リーダーは動作していますが、対応リーダーか確認できませんでした。続行します。"
   else
     maybe_reader_busy_hint "$out"
     reader_help
-    die "NFC リーダーを認識できませんでした。"
+    die "リーダーが見つかりませんでした。接続を確認してください。"
   fi
 
   # カード種別を判定(TAG_TYPE / TAG_SAK / TAG_DEVICE をセット)
   parse_tag_type "$out"
+  # 機械可読行(アプリの mergeDetect 用)は字下げして詳細扱いにし、かんたんログには出さない。
   if [ -n "$TAG_SAK" ]; then
-    info "カード種別を判定しました: ${BOLD}${TAG_TYPE}${RST} (SAK=${TAG_SAK})"
+    detail "カード種別を判定しました: ${TAG_TYPE} (SAK=${TAG_SAK})"
   else
-    info "カード種別を判定しました: ${BOLD}${TAG_TYPE}${RST}"
+    detail "カード種別を判定しました: ${TAG_TYPE}"
   fi
+  # ユーザ向けには種別を平易な言葉で伝える(SAK/種別トークンは出さない)。
+  ok "カードを確認しました（$(friendly_tag_label "$TAG_TYPE")）"
+}
+
+# カード種別トークンを、ユーザ向けの平易な日本語ラベルに変換する。
+friendly_tag_label() {
+  case "$1" in
+    classic) printf 'MIFARE Classic' ;;
+    type2)   printf 'NTAG・iPhone対応' ;;
+    type4)   printf 'DESFire' ;;
+    felica)  printf 'FeliCa' ;;
+    *)       printf '種別不明' ;;
+  esac
 }
 
 # 判定したカード種別に応じて、書き込み処理の対応可否を決める。
@@ -593,57 +628,57 @@ route_tag_or_die() {
   esac
 }
 
-# mfclassic のバックアップ本体(リトライ対象。出力は sed 整形して表示)。
-_run_backup() { nfc-mfclassic R a "$1" 2>&1 | sed 's/^/    /'; }
+# mfclassic のバックアップ本体(リトライ対象。生出力は detail で詳細ログのみに回す)。
+_run_backup() { nfc-mfclassic R a "$1" 2>&1 | detail; }
 
 backup_card() {
   # バックアップは MIFARE Classic 専用。他種別ではスキップを通知。
   if [ "${TAG_TYPE:-classic}" != "classic" ]; then
-    warn "バックアップは MIFARE Classic 専用のためスキップします(現在: ${TAG_TYPE:-不明})。"
+    detail "バックアップは MIFARE Classic 専用のためスキップします(現在: ${TAG_TYPE:-不明})。"
     return 0
   fi
   if [ "$DO_BACKUP" -ne 1 ]; then
-    warn "バックアップをスキップします(--no-backup)。"
+    warn "バックアップは行いません。"
     return 0
   fi
   mkdir -p "$BACKUP_DIR"
   local ts file rc=0
   ts="$(date +%Y%m%d-%H%M%S)"
   file="$BACKUP_DIR/backup-$ts.mfd"
-  info "カードをバックアップします → $file"
+  info "念のためカードの内容をバックアップしています…"
+  detail "バックアップ先: $file"
   # R = 読み取り(鍵が分からないセクターはスキップして継続) / a = Key A
-  retry "バックアップ(nfc-mfclassic)" _run_backup "$file" || rc=$?
+  retry "バックアップ" _run_backup "$file" || rc=$?
   if [ "$rc" -eq 0 ]; then
-    if [ -s "$file" ]; then ok "バックアップを保存しました: $file"
-    else warn "バックアップファイルが空です。"; fi
+    if [ -s "$file" ]; then ok "バックアップを保存しました"
+    else warn "バックアップは空でした。"; fi
   else
-    warn "バックアップでエラーが発生しました(デフォルト以外の鍵が使われている可能性)。"
-    [ -s "$file" ] && warn "部分的なバックアップは保存されています: $file"
-    confirm "完全なバックアップ無しで続行しますか？" || die "中止しました。"
+    warn "バックアップを完全には取得できませんでした（このまま続行できます）。"
+    [ -s "$file" ] && detail "部分的なバックアップは保存されています: $file"
+    confirm "バックアップ無しで続行しますか？" || die "中止しました。"
   fi
 }
 
-_run_format() { mifare-classic-format -y 2>&1 | sed 's/^/    /'; }
+_run_format() { mifare-classic-format -y 2>&1 | detail; }
 
 format_card() {
-  info "カードを NDEF フォーマットします(mifare-classic-format)…"
+  info "カードを初期化しています…"
   local rc=0
-  retry "フォーマット(mifare-classic-format)" _run_format || rc=$?
-  [ "$rc" -eq 0 ] || die "フォーマットに失敗しました。"
-  ok "フォーマット完了。"
+  retry "初期化" _run_format || rc=$?
+  [ "$rc" -eq 0 ] || die "初期化に失敗しました。カードを置き直してもう一度お試しください。"
+  ok "初期化が完了しました"
 }
 
-_run_write_classic() { mifare-classic-write-ndef -y -i "$1" 2>&1 | sed 's/^/    /'; }
+_run_write_classic() { mifare-classic-write-ndef -y -i "$1" 2>&1 | detail; }
 
 write_url() {
   build_ndef_message "$TARGET_URL" "$TMP_WORK/ndef.bin"
-  info "NDEF URL を書き込みます: ${BOLD}${TARGET_URL}${RST}"
-  printf '    NDEF メッセージ (%s バイト): ' "$(wc -c < "$TMP_WORK/ndef.bin" | tr -d ' ')"
-  xxd -p "$TMP_WORK/ndef.bin" | tr -d '\n'; echo
+  info "書き込み中です…（${TARGET_URL}）"
+  detail "NDEF メッセージ ($(wc -c < "$TMP_WORK/ndef.bin" | tr -d ' ') バイト): $(xxd -p "$TMP_WORK/ndef.bin" | tr -d '\n')"
   local rc=0
-  retry "書き込み(write-ndef)" _run_write_classic "$TMP_WORK/ndef.bin" || rc=$?
-  [ "$rc" -eq 0 ] || die "書き込み(write-ndef)に失敗しました。"
-  ok "URL を書き込みました。"
+  retry "書き込み" _run_write_classic "$TMP_WORK/ndef.bin" || rc=$?
+  [ "$rc" -eq 0 ] || die "書き込みに失敗しました。カードを置き直してもう一度お試しください。"
+  ok "書き込みが完了しました"
 }
 
 # read-ndef をリトライ付きで実行。成功時 readback.bin を生成。
@@ -651,23 +686,22 @@ write_url() {
 _read_ndef_classic() {
   READ_NDEF_OUT="$(mifare-classic-read-ndef -y -o "$1" 2>&1)"
   local rc=$?
-  printf '%s\n' "$READ_NDEF_OUT" | sed 's/^/    /'
+  printf '%s\n' "$READ_NDEF_OUT" | detail
   return "$rc"
 }
 
 verify_url() {
-  info "read-ndef で検証します…"
+  info "書き込んだ内容を確認しています…"
   local rc=0
-  retry "検証(read-ndef)" _read_ndef_classic "$TMP_WORK/readback.bin" || rc=$?
-  [ "$rc" -eq 0 ] || die "検証(read-ndef)に失敗しました。"
-  printf '    読み戻し (%s バイト): ' "$(wc -c < "$TMP_WORK/readback.bin" | tr -d ' ')"
-  xxd -p "$TMP_WORK/readback.bin" | tr -d '\n'; echo
+  retry "確認" _read_ndef_classic "$TMP_WORK/readback.bin" || rc=$?
+  [ "$rc" -eq 0 ] || die "書き込み後の確認に失敗しました。"
+  detail "読み戻し ($(wc -c < "$TMP_WORK/readback.bin" | tr -d ' ') バイト): $(xxd -p "$TMP_WORK/readback.bin" | tr -d '\n')"
   if cmp -s "$TMP_WORK/ndef.bin" "$TMP_WORK/readback.bin"; then
-    ok "検証OK — 読み戻しが書き込み内容と一致しました(URL: $TARGET_URL)"
+    ok "読み取って確認しました：${TARGET_URL}"
   elif grep -aq "$URI_REST" "$TMP_WORK/readback.bin"; then
-    warn "バイト列は完全一致しませんでしたが URL は含まれています。概ね問題ありません。"
+    ok "読み取って確認しました：${TARGET_URL}"
   else
-    die "検証に失敗しました — 読み戻しが一致しません。"
+    die "書き込んだ内容が確認できませんでした。もう一度お試しください。"
   fi
 }
 
@@ -768,98 +802,98 @@ extract_type2_ndef() {
   return 1
 }
 
-_ul_read() { nfc-mfultralight r "$1" 2>&1 | sed 's/^/    /'; }
+_ul_read() { nfc-mfultralight r "$1" 2>&1 | detail; }
 # 書き戻し: OTP/Lock/DynLock/UID の各プロンプトへ 'n' を送り、危険ページを書かない。
-_ul_write() { printf 'n\nn\nn\nn\n' | nfc-mfultralight w "$1" 2>&1 | sed 's/^/    /'; }
+_ul_write() { printf 'n\nn\nn\nn\n' | nfc-mfultralight w "$1" 2>&1 | detail; }
 
 write_url_type2() {
-  warn "【実験的機能】Type2(NTAG/Ultralight)への書き込みを行います。"
-  warn "ロック/OTP ページには一切書き込みません(タグ保護のため)。"
-  confirm "この Type2 カードに実験的に書き込みますか？" || die "中止しました。"
+  warn "このカード（NTAG）への書き込みは実験的機能です。"
+  detail "ロック/OTP ページには一切書き込みません(タグ保護のため)。"
+  confirm "このカードに書き込みますか？" || die "中止しました。"
 
   build_ndef_message "$TARGET_URL" "$TMP_WORK/ndef.bin"
-  info "NDEF URL を書き込みます(Type2): ${BOLD}${TARGET_URL}${RST}"
+  info "書き込み中です…（${TARGET_URL}）"
 
   # 1) 現在のカードを読み出して、正しい容量/UID/CC/ロックを保持したイメージを得る
-  info "カードを読み出して安全な書き込みイメージを作成します(nfc-mfultralight r)…"
+  detail "カードを読み出して安全な書き込みイメージを作成します(nfc-mfultralight r)…"
   local rc=0
-  retry "Type2 読み出し(nfc-mfultralight r)" _ul_read "$TMP_WORK/ul_dump.mfd" || rc=$?
+  retry "カードの読み出し" _ul_read "$TMP_WORK/ul_dump.mfd" || rc=$?
   if [ "$rc" -ne 0 ] || [ ! -s "$TMP_WORK/ul_dump.mfd" ]; then
-    die "Type2 カードの読み出しに失敗しました。空/ロック/パスワード保護の可能性があります。安全のためブラインド書き込みは行いません。"
+    die "カードを読み出せませんでした。空・ロック・パスワード保護の可能性があります。安全のため書き込みは行いません。"
   fi
 
   # 2) TLV を組み立て、データページ(page4以降)にのみ差し込む
   local tlv_hex
-  tlv_hex="$(build_type2_tlv_hex "$TMP_WORK/ndef.bin")" || die "NDEF が Type2 の1バイト長TLVに収まりません。"
+  tlv_hex="$(build_type2_tlv_hex "$TMP_WORK/ndef.bin")" || die "URL が長すぎてこのカードに収まりません。"
   if ! patch_type2_dump "$TMP_WORK/ul_dump.mfd" "$tlv_hex" "$TMP_WORK/ul_write.mfd"; then
-    die "書き込みイメージの生成に失敗しました(容量不足の可能性)。より大きな NTAG をご利用ください。"
+    die "このカードには容量が足りません。より大きな NTAG をご利用ください。"
   fi
 
   # 3) 書き戻し(危険ページはプロンプトに 'n' を返して回避)
-  info "イメージを書き戻します(nfc-mfultralight w、ロック/OTP は書きません)…"
+  detail "イメージを書き戻します(nfc-mfultralight w、ロック/OTP は書きません)…"
   rc=0
-  retry "Type2 書き込み(nfc-mfultralight w)" _ul_write "$TMP_WORK/ul_write.mfd" || rc=$?
-  [ "$rc" -eq 0 ] || die "Type2 書き込みに失敗しました。"
-  ok "Type2 への書き込みを実行しました(実験的機能)。"
+  retry "書き込み" _ul_write "$TMP_WORK/ul_write.mfd" || rc=$?
+  [ "$rc" -eq 0 ] || die "書き込みに失敗しました。カードを置き直してもう一度お試しください。"
+  ok "書き込みが完了しました"
 
   # 4) 検証: 読み戻して NDEF/URL が載っているか確認
-  info "読み戻して検証します(nfc-mfultralight r)…"
+  info "書き込んだ内容を確認しています…"
   rc=0
-  retry "Type2 検証読み出し(nfc-mfultralight r)" _ul_read "$TMP_WORK/ul_verify.mfd" || rc=$?
+  retry "確認" _ul_read "$TMP_WORK/ul_verify.mfd" || rc=$?
   if [ "$rc" -eq 0 ] && [ -s "$TMP_WORK/ul_verify.mfd" ]; then
     if grep -aq "$URI_REST" "$TMP_WORK/ul_verify.mfd"; then
-      ok "検証OK — カード上に URL を確認しました(URL: $TARGET_URL)"
+      ok "読み取って確認しました：${TARGET_URL}"
     else
-      warn "書き込みは実行しましたが、検証で URL を確認できませんでした。iPhone 等で実機確認をおすすめします。"
+      warn "書き込みは完了しましたが、確認できませんでした。iPhone 等での実機確認をおすすめします。"
     fi
   else
-    warn "検証用の読み出しに失敗しました。書き込み自体は実行済みです。"
+    warn "書き込み後の確認に失敗しました。書き込み自体は完了しています。"
   fi
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  実験的: Type4 (MIFARE DESFire)
 # ═════════════════════════════════════════════════════════════════════════════
-_df_create() { mifare-desfire-create-ndef -y 2>&1 | sed 's/^/    /'; }
-_df_write()  { mifare-desfire-write-ndef -y -i "$1" 2>&1 | sed 's/^/    /'; }
-_df_read()   { mifare-desfire-read-ndef -y -o "$1" 2>&1 | sed 's/^/    /'; }
+_df_create() { mifare-desfire-create-ndef -y 2>&1 | detail; }
+_df_write()  { mifare-desfire-write-ndef -y -i "$1" 2>&1 | detail; }
+_df_read()   { mifare-desfire-read-ndef -y -o "$1" 2>&1 | detail; }
 
 write_url_type4() {
-  warn "【実験的機能】Type4(MIFARE DESFire)への書き込みを行います。"
-  confirm "この Type4(DESFire)カードに実験的に書き込みますか？" || die "中止しました。"
+  warn "このカード（DESFire）への書き込みは実験的機能です。"
+  confirm "このカードに書き込みますか？" || die "中止しました。"
 
   build_ndef_message "$TARGET_URL" "$TMP_WORK/ndef.bin"
-  info "NDEF URL を書き込みます(Type4/DESFire): ${BOLD}${TARGET_URL}${RST}"
+  info "書き込み中です…（${TARGET_URL}）"
 
   local rc=0
   # --format 指定時のみ NDEF アプリケーションを作成(既存 NDEF タグを壊さない)
   if [ "$DO_FORMAT" -eq 1 ]; then
-    info "DESFire を NFC Forum Type4 として初期化します(create-ndef)…"
+    detail "DESFire を NFC Forum Type4 として初期化します(create-ndef)…"
     rc=0
-    retry "DESFire 初期化(create-ndef)" _df_create || rc=$?
-    [ "$rc" -eq 0 ] || die "DESFire の NDEF アプリケーション作成に失敗しました。"
+    retry "初期化" _df_create || rc=$?
+    [ "$rc" -eq 0 ] || die "カードの初期化に失敗しました。"
   fi
 
-  info "NDEF を書き込みます(write-ndef)…"
+  detail "NDEF を書き込みます(write-ndef)…"
   rc=0
-  retry "DESFire 書き込み(write-ndef)" _df_write "$TMP_WORK/ndef.bin" || rc=$?
+  retry "書き込み" _df_write "$TMP_WORK/ndef.bin" || rc=$?
   if [ "$rc" -ne 0 ]; then
     # 未初期化の DESFire だと write が失敗する。--format を案内。
-    die "DESFire への書き込みに失敗しました。未初期化の可能性があります。--format を付けて再実行してください。"
+    die "書き込みに失敗しました。「フォーマット（初期化）」を実行してから、もう一度お試しください。"
   fi
-  ok "Type4(DESFire)への書き込みを実行しました(実験的機能)。"
+  ok "書き込みが完了しました"
 
-  info "read-ndef で検証します…"
+  info "書き込んだ内容を確認しています…"
   rc=0
-  retry "DESFire 検証(read-ndef)" _df_read "$TMP_WORK/readback.bin" || rc=$?
+  retry "確認" _df_read "$TMP_WORK/readback.bin" || rc=$?
   if [ "$rc" -eq 0 ] && [ -s "$TMP_WORK/readback.bin" ]; then
     if cmp -s "$TMP_WORK/ndef.bin" "$TMP_WORK/readback.bin" || grep -aq "$URI_REST" "$TMP_WORK/readback.bin"; then
-      ok "検証OK — カード上に URL を確認しました(URL: $TARGET_URL)"
+      ok "読み取って確認しました：${TARGET_URL}"
     else
-      warn "書き込みは実行しましたが、読み戻しが一致しませんでした。"
+      warn "書き込みは完了しましたが、確認できませんでした。"
     fi
   else
-    warn "検証用の読み出しに失敗しました。書き込み自体は実行済みです。"
+    warn "書き込み後の確認に失敗しました。書き込み自体は完了しています。"
   fi
 }
 
@@ -886,15 +920,14 @@ decode_ndef() {
 
 # 読み取ったバイナリを表示し、URL を復元して報告する共通処理。
 _report_read_result() {
-  printf '    NDEF (%s バイト): ' "$(wc -c < "$1" | tr -d ' ')"
-  xxd -p "$1" | tr -d '\n'; echo
+  detail "NDEF ($(wc -c < "$1" | tr -d ' ') バイト): $(xxd -p "$1" | tr -d '\n')"
   local decoded; decoded="$(decode_ndef "$1")"
-  if [ -n "$decoded" ]; then ok "URL: ${BOLD}${decoded}${RST}"; sound_ok
-  else warn "URI レコードとして解釈できませんでした(上の生バイトを参照)。"; fi
+  if [ -n "$decoded" ]; then ok "読み取って確認しました：${decoded}"; sound_ok
+  else warn "URL として読み取れませんでした。空のカードか、別の形式で書かれている可能性があります。"; fi
 }
 
 read_card() {
-  info "カードに書かれている NDEF を読み取ります…"
+  info "カードの内容を読み取っています…"
   require_cmd xxd || die "xxd が見つかりません。"
   ensure_libnfc
   check_reader
@@ -906,42 +939,42 @@ read_card() {
       fi
       ensure_ndef_tools
       local rc=0
-      retry "読み取り(read-ndef)" _read_ndef_classic "$TMP_WORK/readback.bin" || rc=$?
+      retry "読み取り" _read_ndef_classic "$TMP_WORK/readback.bin" || rc=$?
       if [ "$rc" -ne 0 ]; then
         # 空カード(未フォーマット)を優しいメッセージに置き換える
         if printf '%s' "${READ_NDEF_OUT:-}" | grep -qi 'No MAD detected'; then
-          err "このカードはまだ空です(NDEF 未フォーマット)。先に『書き込む』を実行してください。"
+          err "このカードはまだ空です。「書き込む」でURLを書き込めます。"
           sound_ng; exit 1
         fi
         maybe_reader_busy_hint "${READ_NDEF_OUT:-}"
-        die "読み取りに失敗しました。"
+        die "読み取りに失敗しました。カードを置き直してもう一度お試しください。"
       fi
       _report_read_result "$TMP_WORK/readback.bin"
       ;;
     type4)
-      warn "【実験的機能】Type4(DESFire)から読み取ります。"
+      detail "【実験的機能】Type4(DESFire)から読み取ります。"
       local rc=0
-      retry "読み取り(DESFire read-ndef)" _df_read "$TMP_WORK/readback.bin" || rc=$?
+      retry "読み取り" _df_read "$TMP_WORK/readback.bin" || rc=$?
       if [ "$rc" -ne 0 ] || [ ! -s "$TMP_WORK/readback.bin" ]; then
-        err "このカードはまだ空か、NDEF 未対応です。先に『書き込む』(--format 併用)を実行してください。"
+        err "このカードはまだ空です。「書き込む」（初回は「フォーマット（初期化）」）でURLを書き込めます。"
         sound_ng; exit 1
       fi
       _report_read_result "$TMP_WORK/readback.bin"
       ;;
     type2)
-      warn "【実験的機能】Type2(NTAG/Ultralight)から読み取ります。"
+      detail "【実験的機能】Type2(NTAG/Ultralight)から読み取ります。"
       local rc=0
-      retry "読み取り(nfc-mfultralight r)" _ul_read "$TMP_WORK/ul_dump.mfd" || rc=$?
+      retry "読み取り" _ul_read "$TMP_WORK/ul_dump.mfd" || rc=$?
       if [ "$rc" -ne 0 ] || [ ! -s "$TMP_WORK/ul_dump.mfd" ]; then
-        err "このカードはまだ空か、読み取りに失敗しました。先に『書き込む』を実行してください。"
+        err "このカードはまだ空です。「書き込む」でURLを書き込めます。"
         sound_ng; exit 1
       fi
       # ダンプ(page4以降)から NDEF TLV を取り出して URL を復元
       if extract_type2_ndef "$TMP_WORK/ul_dump.mfd" "$TMP_WORK/readback.bin" && [ -s "$TMP_WORK/readback.bin" ]; then
         _report_read_result "$TMP_WORK/readback.bin"
       else
-        warn "ダンプから NDEF を取り出せませんでした。生ダンプの先頭を参照してください:"
-        xxd "$TMP_WORK/ul_dump.mfd" 2>/dev/null | head -8 | sed 's/^/    /'
+        warn "このカードから URL を読み取れませんでした。まだ空の可能性があります。"
+        xxd "$TMP_WORK/ul_dump.mfd" 2>/dev/null | head -8 | detail
       fi
       ;;
     felica)
@@ -1173,7 +1206,7 @@ if [ "$DO_READ" -eq 1 ]; then
 fi
 
 main() {
-  info "対象 URL: ${BOLD}${TARGET_URL}${RST}"
+  info "書き込む URL：${TARGET_URL}"
   require_cmd xxd || die "xxd が見つかりません(macOS には通常同梱されています)。"
   ensure_libnfc
   check_reader

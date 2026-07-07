@@ -76,6 +76,87 @@ struct DetectState {
     }
 }
 
+// MARK: - かんたんログ（友好的ログ）の行モデル
+
+/// 1行のかんたんログ。スクリプト出力を非開発者向けに分類・整形したもの。
+struct FriendlyRow: Identifiable {
+    enum Kind { case ok, error, warn, step, retry, plain }
+    let id: Int             // 表示順（行インデックス）。再描画で安定させるため決定的にする。
+    let kind: Kind
+    let text: String        // マーカー（==> / ✓ / ✗ / ![注意]）を除いた表示テキスト
+    let url: String?        // 行に URL を含む場合はその URL（強調表示用）
+}
+
+/// スクリプト出力（NFC_VERBOSE=1 でキャプチャした生ログ）を
+/// 「かんたんログ」行と「詳細ログ（生出力）」に振り分けるパーサ。
+enum LogParser {
+    /// 行が「詳細（開発者向け）」かどうか。4スペース字下げ、または技術的パターンに一致するもの。
+    static func isDetailLine(_ raw: String) -> Bool {
+        // 4スペース字下げ = スクリプトの detail() が付ける詳細マーカー。
+        if raw.hasPrefix("    ") || raw.hasPrefix("\t") { return true }
+        let t = raw.trimmingCharacters(in: .whitespaces)
+        if t.isEmpty { return false }
+        // 16進ダンプらしき行（16進とスペースのみで8文字以上）
+        if t.count >= 8, t.range(of: "^[0-9a-fA-F ]{8,}$", options: .regularExpression) != nil {
+            return true
+        }
+        // 技術用語を含む行（libnfc/libfreefare の生出力）
+        let techMarkers = ["SAK", "ATQA", "UID", "SENS_RES", "SEL_RES", "NFCID",
+                           "nfc-list", "libnfc", "PICC Interface opened",
+                           "ISO/IEC 14443", "ISO14443", "MIFARE Ultralight card",
+                           "NTAG Type", "Reading ", "Writing data to file"]
+        for m in techMarkers where t.contains(m) { return true }
+        return false
+    }
+
+    /// 生ログをかんたんログ行の配列へ変換する（詳細行は除外）。
+    static func friendlyRows(_ output: String) -> [FriendlyRow] {
+        var rows: [FriendlyRow] = []
+        var idx = 0
+        for rawLine in output.components(separatedBy: "\n") {
+            if isDetailLine(rawLine) { continue }
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            rows.append(row(from: line, id: idx))
+            idx += 1
+        }
+        return rows
+    }
+
+    /// 1行をマーカーから分類し、表示テキストと URL を取り出す。
+    static func row(from line: String, id: Int) -> FriendlyRow {
+        var kind: FriendlyRow.Kind = .plain
+        var text = line
+
+        if text.hasPrefix("✓") {
+            kind = .ok; text = String(text.dropFirst())
+        } else if text.hasPrefix("✗") {
+            kind = .error; text = String(text.dropFirst())
+        } else if text.hasPrefix("![注意]") {
+            kind = .warn; text = String(text.dropFirst("![注意]".count))
+        } else if text.hasPrefix("【") || text.contains("注意") {
+            kind = .warn
+        } else if text.hasPrefix("==>") {
+            text = String(text.dropFirst("==>".count))
+            // 再試行の通知は専用の見た目にする。
+            kind = text.contains("再試行") ? .retry : .step
+        } else if text.contains("再試行") {
+            kind = .retry
+        }
+
+        text = text.trimmingCharacters(in: .whitespaces)
+        let url = firstURL(in: text)
+        return FriendlyRow(id: id, kind: kind, text: text, url: url)
+    }
+
+    /// 行から最初の URL らしき文字列を取り出す（http(s):// で始まる連続文字列）。
+    static func firstURL(in text: String) -> String? {
+        guard let r = text.range(of: "https?://[^\\s、。）]+", options: .regularExpression)
+        else { return nil }
+        return String(text[r])
+    }
+}
+
 // MARK: - モデル
 
 final class AppModel: ObservableObject {
@@ -337,7 +418,9 @@ final class AppModel: ObservableObject {
             return (-1, "アプリ内に write-url.sh が見つかりません。")
         }
         var args = [script]
-        var env: [String: String] = ["NFC_BACKUP_DIR": backupDir]
+        // NFC_VERBOSE=1: 生ツール出力(16進/UID/SAK 等)も含めてキャプチャする。
+        // アプリは「かんたんログ」を既定表示し、この生出力は「詳細ログ」トグルで見せる。
+        var env: [String: String] = ["NFC_BACKUP_DIR": backupDir, "NFC_VERBOSE": "1"]
         switch action {
         case "write":  args += ["--yes"]; env["TARGET_URL"] = url
         case "format": args += ["--format", "--yes"]; env["TARGET_URL"] = url
@@ -578,11 +661,82 @@ private struct StatusPill: View {
     }
 }
 
+// MARK: - かんたんログの1行ビュー
+
+private struct FriendlyRowView: View {
+    let row: FriendlyRow
+
+    private var icon: String? {
+        switch row.kind {
+        case .ok:    return "✅"
+        case .error: return "❌"
+        case .warn:  return "⚠️"
+        case .retry: return "🔄"
+        case .step, .plain: return nil
+        }
+    }
+
+    private var textColor: Color {
+        switch row.kind {
+        case .ok:    return Palette.green
+        case .error: return Palette.red
+        case .warn:  return Palette.amber
+        case .retry: return .secondary
+        case .step:  return .primary.opacity(0.75)
+        case .plain: return .primary.opacity(0.85)
+        }
+    }
+
+    private var weight: Font.Weight {
+        switch row.kind {
+        case .ok, .error: return .semibold
+        default:          return .regular
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            if let icon = icon {
+                Text(icon).font(.system(size: 13))
+                    .frame(width: 18, alignment: .leading)
+            } else if row.kind == .step {
+                // 進行中ステップは控えめなドットで示す。
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 5))
+                    .foregroundColor(.secondary.opacity(0.5))
+                    .frame(width: 18, alignment: .center)
+                    .padding(.top, 5)
+            } else {
+                Color.clear.frame(width: 18, height: 1)
+            }
+            rowText
+                .font(.system(size: 13.5, weight: weight))
+                .foregroundColor(textColor)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+        }
+    }
+
+    /// URL を含む行は URL 部分を強調表示する。
+    private var rowText: Text {
+        guard let url = row.url, let r = row.text.range(of: url) else {
+            return Text(row.text)
+        }
+        let before = String(row.text[row.text.startIndex..<r.lowerBound])
+        let after  = String(row.text[r.upperBound...])
+        return Text(before)
+            + Text(url).foregroundColor(Palette.blue).fontWeight(.semibold)
+            + Text(after)
+    }
+}
+
 // MARK: - 画面
 
 struct ContentView: View {
     @StateObject private var model = AppModel()
     @State private var showCompat = false
+    @State private var showRawLog = false
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -792,27 +946,38 @@ struct ContentView: View {
         }
     }
 
+    // かんたんログ（既定表示）＋ 詳細ログ（生出力）トグル。
     private var console: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 10) {
+            friendlyLog
+            rawLogDisclosure
+        }
+    }
+
+    // かんたんログ：非開発者向けの読みやすい行。アイコン＋システムフォント。
+    private var friendlyLog: some View {
+        let rows = LogParser.friendlyRows(model.log)
+        return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
-                Image(systemName: "terminal").font(.system(size: 11, weight: .semibold))
+                Image(systemName: "text.alignleft").font(.system(size: 11, weight: .semibold))
                 Text("ログ").font(.system(size: 11, weight: .semibold))
                 Spacer()
                 if model.busy { ProgressView().controlSize(.small) }
             }
-            .foregroundColor(.white.opacity(0.7))
+            .foregroundColor(.secondary)
             .padding(.horizontal, 13).padding(.vertical, 9)
 
-            Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+            Divider()
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    Text(model.log)
-                        .font(.system(.footnote, design: .monospaced))
-                        .foregroundColor(Color(red: 0.85, green: 0.90, blue: 1.0))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 13).padding(.vertical, 11)
+                    VStack(alignment: .leading, spacing: 7) {
+                        ForEach(rows) { row in
+                            FriendlyRowView(row: row)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14).padding(.vertical, 12)
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .onChange(of: model.log) { _ in
@@ -820,8 +985,54 @@ struct ContentView: View {
                 }
             }
         }
-        .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(Palette.console))
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
         .frame(minHeight: 210)
+    }
+
+    // 詳細ログ：開発者/デバッグ向けに、キャプチャした生出力を等幅ダークで表示（既定は閉じる）。
+    private var rawLogDisclosure: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { showRawLog.toggle() }
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "terminal")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    Text("詳細ログを表示")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.primary.opacity(0.85))
+                    Spacer()
+                    Image(systemName: showRawLog ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+
+            if showRawLog {
+                ScrollView {
+                    Text(model.log)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundColor(Color(red: 0.85, green: 0.90, blue: 1.0))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 13).padding(.vertical, 11)
+                }
+                .frame(minHeight: 180, maxHeight: 320)
+                .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(Palette.console))
+                .padding(.top, 8)
+            }
+        }
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
     }
 
     // 対応状況（何が使えるか）を平易に示す開閉式パネル
