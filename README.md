@@ -70,6 +70,7 @@ The tool auto-detects the tag type from its SAK (or FeliCa signaling) on every r
 - **Backup before write** — dumps the card to a timestamped `.mfd` file before making any changes.
 - **Verify after write** — reads the card back and compares it against what was written, so a "success" actually means success.
 - **Automatic retries** — reader detection, backup, format, and write/read operations retry automatically (up to 4 attempts) before failing, which smooths over machines where macOS's smart-card daemon races `libnfc` for the reader.
+- **Self-healing MIFARE Classic write** — if a normal write fails (e.g. a previously-used card with non-default keys), the tool automatically re-initializes the card and writes again, instead of surfacing a raw crash/error.
 - **Sound feedback** — plays a success or failure sound (via the Mac's own speaker, and the ACR122U's own beep when available) when a write or read finishes, so you don't have to stare at the terminal. Disable with `--no-sound` or `NFC_SOUND=0`.
 - **Friendlier empty-card message** — reading a blank/unformatted card reports a plain "this card is still empty" message instead of a scary-looking error.
 - **Universal binary** — builds for both Apple Silicon (`arm64`) and Intel (`x86_64`).
