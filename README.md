@@ -73,6 +73,7 @@ The tool auto-detects the tag type from its SAK (or FeliCa signaling) on every r
 - **Automatic retries** — reader detection, backup, format, and write/read operations retry automatically (up to 4 attempts) before failing, which smooths over machines where macOS's smart-card daemon races `libnfc` for the reader.
 - **Self-healing MIFARE Classic write** — if a normal write fails (e.g. a previously-used card with non-default keys), the tool automatically re-initializes the card and writes again, instead of surfacing a raw crash/error.
 - **Sound feedback** — plays a success or failure sound (via the Mac's own speaker, and the ACR122U's own beep when available) when a write or read finishes, so you don't have to stare at the terminal. Disable with `--no-sound` or `NFC_SOUND=0`.
+- **Reliable app sound + tidy install** — the app now plays its own success/failure sound directly (fixing cases where the backgrounded sound could get lost when running from the `.app`), and after launch it offers to eject and delete the install DMG once you've copied the app to Applications. The DMG itself also has a clearer drag-to-Applications layout.
 - **Friendlier empty-card message** — reading a blank/unformatted card reports a plain "this card is still empty" message instead of a scary-looking error.
 - **Universal binary** — builds for both Apple Silicon (`arm64`) and Intel (`x86_64`).
 
