@@ -629,7 +629,7 @@ route_tag_or_die() {
 }
 
 # mfclassic のバックアップ本体(リトライ対象。生出力は detail で詳細ログのみに回す)。
-_run_backup() { nfc-mfclassic R a "$1" 2>&1 | detail; }
+_run_backup() { nfc-mfclassic r A u "$1" 2>&1 | detail; }
 
 backup_card() {
   # バックアップは MIFARE Classic 専用。他種別ではスキップを通知。
@@ -647,15 +647,15 @@ backup_card() {
   file="$BACKUP_DIR/backup-$ts.mfd"
   info "念のためカードの内容をバックアップしています…"
   detail "バックアップ先: $file"
-  # R = 読み取り(鍵が分からないセクターはスキップして継続) / a = Key A
+  # r = 通常読み取り / A = Key A(鍵不明のセクターはスキップして継続) / u = 任意UID
+  # ※ libnfc 1.8.0 の nfc-mfclassic は u(UID指定)が必須。
+  #   バックアップは best-effort で、失敗しても書き込みは止めない(安全のための任意機能)。
   retry "バックアップ" _run_backup "$file" || rc=$?
-  if [ "$rc" -eq 0 ]; then
-    if [ -s "$file" ]; then ok "バックアップを保存しました"
-    else warn "バックアップは空でした。"; fi
+  if [ "$rc" -eq 0 ] && [ -s "$file" ]; then
+    ok "バックアップを保存しました"
   else
-    warn "バックアップを完全には取得できませんでした（このまま続行できます）。"
+    warn "バックアップは取得できませんでしたが、書き込みは続行します。"
     [ -s "$file" ] && detail "部分的なバックアップは保存されています: $file"
-    confirm "バックアップ無しで続行しますか？" || die "中止しました。"
   fi
 }
 
