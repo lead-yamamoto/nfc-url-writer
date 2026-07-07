@@ -42,23 +42,35 @@ The usual fix is a cryptic dance with `launchctl bootout` / `disable` followed b
 
 | Tag | Status | Notes |
 | --- | --- | --- |
-| **MIFARE Classic 1K** | ✅ Fully supported | Primary target. Requires an **NXP-based reader** such as the **ACR122U**. Sony FeliCa readers (e.g. **RC-S300**, **RC-S380**) cannot do the MIFARE Classic Crypto1 authentication and will not work here. |
-| **NTAG213 / NTAG215 / NTAG216 (NFC Forum Type 2)** | 🧪 Experimental | This is the **iPhone-readable** option (see [iPhone compatibility](#iphone-compatibility--please-read)). Writes via a read‑modify‑write that only touches NDEF data pages — lock/OTP/UID pages are never written. |
+| **MIFARE Classic 1K** | ✅ Fully supported | Primary target. Requires an **NXP-based reader** such as the **ACR122U**. |
+| **NTAG213 / NTAG215 / NTAG216 (NFC Forum Type 2)** | 🟡 Supported (beta) | This is the **iPhone-readable** option (see [iPhone compatibility](#iphone-compatibility--please-read)). Writes via a read‑modify‑write that only touches NDEF data pages — lock/OTP/UID pages are never written. Verified on real NTAG215 hardware: write → in-line verify → independent read-back round-trips correctly, including custom URLs. Still newer than the MIFARE Classic path, so it's labeled beta rather than fully mature. |
 | **MIFARE DESFire (NFC Forum Type 4)** | 🧪 Experimental | Basic create-ndef / write-ndef / read-ndef flow. |
 | **FeliCa** | ❌ Not supported | Detected and rejected with a clear error — no NDEF write path exists for FeliCa here. |
 
 The tool auto-detects the tag type from its SAK (or FeliCa signaling) on every run and routes to the right code path, refusing with a specific error rather than a confusing hardware failure.
 
+### Reader compatibility
+
+| Reader | Status | Notes |
+| --- | --- | --- |
+| **ACR122U** (and other NXP/libnfc-compatible readers) | ✅ Supported | The tool's primary target. |
+| **Sony RC-S300 / PaSoRi (FeliCa Port)** | ❌ Not usable | `libnfc` cannot open this device at all (`nfc_open` fails on it), and even if it could, MIFARE Classic's Crypto1 authentication isn't something a FeliCa-only reader can do. This is a hardware/driver limitation, not something this tool can work around. |
+
+**If both an ACR122U and a Sony PaSoRi are plugged in at the same time**, the tool now detects the working NXP reader and pins it via `LIBNFC_DEFAULT_DEVICE`, so it reliably selects the ACR122U and never gets stuck probing (or hanging on) the incompatible PaSoRi. This fixes a real flakiness issue on Macs that have both readers connected — see **Smart reader selection** below.
+
 ## Features
 
 - **Three interfaces, one engine** — native app, CLI, and a local web GUI, all calling the same audited `write-url.sh`.
+- **Smart reader selection** — automatically picks a working NXP reader (e.g. ACR122U) and skips incompatible ones like a Sony PaSoRi/FeliCa reader, fixing the flakiness on Macs that have both. It does this by pinning `LIBNFC_DEFAULT_DEVICE` to the working driver, so both `nfc-list`-style tools and libfreefare's `mifare-classic-*` tools consistently open the right device instead of racing (or getting stuck on the wrong one).
+- **ACR122U beep restored** via a small bundled libusb helper (`acr122-beep`) that fires the reader's own buzzer on success — falls back to a Mac sound if the helper isn't available for your architecture.
+- **Live reader/tag status + supported-compat panel in the app** — a status panel shows which reader and tag type are currently detected (with color-coded confidence), plus an expandable panel listing supported readers and tag types, so you know what to expect before you write.
 - **One-click setup** — the app detects whether `libnfc` / `libfreefare` are present and **installs them via Homebrew on first run** (with live progress), so non-technical users can get going without touching a terminal.
 - **One-click reader fix** — automates the `com.apple.ifdreader` `launchctl` workaround that trips up nearly everyone on macOS.
 - **Safe by design** — never edits sector trailers, keys, or access bits directly. It hands the NDEF message to `libfreefare`, which manages the MAD, TLV, and NFC-Forum keys correctly.
 - **Backup before write** — dumps the card to a timestamped `.mfd` file before making any changes.
 - **Verify after write** — reads the card back and compares it against what was written, so a "success" actually means success.
 - **Automatic retries** — reader detection, backup, format, and write/read operations retry automatically (up to 4 attempts) before failing, which smooths over machines where macOS's smart-card daemon races `libnfc` for the reader.
-- **Sound feedback** — plays a success or failure sound (via the Mac's own speaker) when a write or read finishes, so you don't have to stare at the terminal. Disable with `--no-sound` or `NFC_SOUND=0`.
+- **Sound feedback** — plays a success or failure sound (via the Mac's own speaker, and the ACR122U's own beep when available) when a write or read finishes, so you don't have to stare at the terminal. Disable with `--no-sound` or `NFC_SOUND=0`.
 - **Friendlier empty-card message** — reading a blank/unformatted card reports a plain "this card is still empty" message instead of a scary-looking error.
 - **Universal binary** — builds for both Apple Silicon (`arm64`) and Intel (`x86_64`).
 
@@ -121,6 +133,9 @@ TARGET_URL="https://example.com/" ./write-url.sh
 
 # Release the reader from macOS's smart-card daemon
 ./write-url.sh --fix-reader
+
+# Check which reader and tag are currently detected, without writing anything
+./write-url.sh --detect
 ```
 
 Useful flags:
@@ -129,14 +144,16 @@ Useful flags:
 | --- | --- |
 | `--format` | NDEF-format the card before writing (required for a fresh card). |
 | `--read` | Read and decode the NDEF URL on the card. |
+| `--detect` | Report the detected reader and tag type, then exit — no write, no format. |
 | `--fix-reader` | Disable `com.apple.ifdreader` so `libnfc` can open the ACR122U. |
 | `--print-ndef` | Print the generated NDEF bytes and exit (no hardware needed). |
 | `--no-backup` | Skip the pre-write backup. |
 | `--no-sound` | Skip the success/failure sound (same as `NFC_SOUND=0`). |
+| `--self-test` | Run internal unit tests (e.g. SAK/tag-type routing) — no hardware needed. |
 | `--yes` / `-y` | Skip confirmation prompts. |
 | `--help` | Full help. |
 
-`NFC_BACKUP_DIR` overrides where backups are written.
+`NFC_BACKUP_DIR` overrides where backups are written. `LIBNFC_DEFAULT_DEVICE` is set automatically by the reader-selection logic above; you normally don't need to set it yourself.
 
 ### Local web GUI — `nfc-gui.py`
 
@@ -168,7 +185,7 @@ write-ndef (URL)          →  read-ndef (verify against what was written)
 >
 > MIFARE Classic is **not** one of the NFC Forum tag types (Type 1–5). iOS Core NFC reads NDEF from NFC-Forum tags, so even though the write succeeds, **an iPhone usually will not react to a MIFARE Classic card** written by this tool.
 >
-> - **For iPhone**, use **NTAG213 / NTAG215 / NTAG216** (NFC Forum Type 2) tags instead — this tool now has **experimental** support for writing to them (see [Supported tags & readers](#supported-tags--readers)).
+> - **For iPhone**, use **NTAG213 / NTAG215 / NTAG216** (NFC Forum Type 2) tags instead — this tool has **beta** support for writing to them, verified on real NTAG215 hardware (see [Supported tags & readers](#supported-tags--readers)).
 > - **Most Android phones can read MIFARE Classic** NDEF just fine.
 
 If your audience is iPhone users, choose NTAG hardware. If you control the readers or target Android, MIFARE Classic 1K works great.
