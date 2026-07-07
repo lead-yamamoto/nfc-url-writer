@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
 #
-# write-url.sh — ACR122U + libnfc/libfreefare で NFC タグに NDEF URL を
-#                書き込む macOS 用 CLI。
+# write-url.sh — libnfc/libfreefare で NFC タグに NDEF URL を書き込む macOS 用 CLI。
 #
-# 主対象は MIFARE Classic 1K。カード種別(SAK)を自動判定し、
-# NTAG213/215/216(Type2) と MIFARE DESFire(Type4) にも実験的に対応。
+# 対応リーダー: libnfc 対応の NXP系リーダー(ACR122U が代表例)。
+#               Sony PaSoRi/RC-S300 等の FeliCa系/PC-SC リーダーは使用できません。
+# 対応タグ:     MIFARE Classic 1K/4K(正式) / NTAG・Type2(実験的) /
+#               DESFire・Type4(実験的) / FeliCa(非対応)。
+#               カード種別(SAK)を自動判定して処理を振り分けます。
 #
 # 使い方:
 #   ./write-url.sh --format     # 初回: NDEF フォーマットしてから URL 書き込み
 #   ./write-url.sh              # 2回目以降: URL の書き込みのみ
+#   ./write-url.sh --detect     # リーダー/カードの状態を判定するだけ(書き込まない)
 #   ./write-url.sh --fix-reader # macOS のスマートカードデーモンを無効化(リーダー認識用)
 #   ./write-url.sh --help       # ヘルプ
+#
+# 安定性(重要): 複数の NFC リーダー(例: ACR122U + Sony PaSoRi)が同時に挿さって
+#   いると、libnfc の既定デバイス選択が Sony 側になり nfc_open が失敗して操作全体が
+#   こける(=「5〜6回押さないと成功しない」現象)。本スクリプトは接続中の対応
+#   リーダー(NXP系)を検出し、LIBNFC_DEFAULT_DEVICE でそのドライバを既定に固定して
+#   この問題を解消する。詳細は select_reader() を参照。
 #
 # 注: 本スクリプトは Swift アプリから macOS 標準 /bin/bash (3.2) で実行される。
 #     連想配列・${var,,}・mapfile 等 bash4+ 専用機能は使用しないこと。
@@ -29,6 +38,7 @@ LOCAL_BIN="$SCRIPT_DIR/bin"               # 自前ビルドしたツールの置
 BACKUP_DIR="${NFC_BACKUP_DIR:-$SCRIPT_DIR/backups}"  # バックアップ(.mfd)の保存先(NFC_BACKUP_DIR で上書き可)
 LIBFREEFARE_REF="libfreefare-0.4.0"       # フォールバックビルド時の参照タグ(brew版に合わせる)
 NDEF_TOOLS=(mifare-classic-format mifare-classic-write-ndef mifare-classic-read-ndef)
+BEEP_BIN="$LOCAL_BIN/acr122-beep"         # ACR122U ブザー制御ヘルパ(任意・libusb 必要)
 
 # リトライ設定(他の Mac でリーダー掴み合いにより数回失敗する問題への対策)
 RETRY_MAX="${NFC_RETRY_MAX:-4}"           # 最大試行回数
@@ -61,7 +71,10 @@ play_sound() {
   [ -f "$1" ] || return 0
   afplay "$1" >/dev/null 2>&1 &
 }
-sound_ok() { play_sound "$SOUND_OK"; }
+# 成功音: Mac 本体スピーカー(保証フォールバック)に加え、選択リーダーが ACR122U の
+# ときはリーダー本体のブザーも鳴らす(ベストエフォート)。reader_beep は
+# LIBNFC_DEFAULT_DEVICE 設定後にのみ意味を持つが、未設定でも安全にスキップされる。
+sound_ok() { play_sound "$SOUND_OK"; reader_beep beep 2>/dev/null || true; }
 sound_ng() { play_sound "$SOUND_NG"; }
 
 # die: 失敗音を鳴らしてから終了。--print-ndef/--fix-reader では鳴らさないよう
@@ -70,7 +83,7 @@ die()  { err "$*"; sound_ng; exit 1; }
 
 usage() {
   cat <<EOF
-${BOLD}write-url.sh${RST} — NFC タグに NDEF URL を書き込む (ACR122U / macOS)
+${BOLD}write-url.sh${RST} — NFC タグに NDEF URL を書き込む (libnfc対応リーダー / macOS)
 
 書き込む URL はこのスクリプト冒頭の TARGET_URL を編集して変更します。
   現在の TARGET_URL: ${BOLD}${TARGET_URL}${RST}
@@ -78,7 +91,8 @@ ${BOLD}write-url.sh${RST} — NFC タグに NDEF URL を書き込む (ACR122U / 
 使い方:
   ./write-url.sh --format      初回。カードを NDEF フォーマットしてから URL を書く
   ./write-url.sh               2回目以降。URL の書き込みのみ
-  ./write-url.sh --fix-reader  macOS が ACR122U を掴んでいる場合に解放する(sudo)
+  ./write-url.sh --detect      リーダー/カードの状態を判定するだけ(書き込まない)
+  ./write-url.sh --fix-reader  macOS がリーダーを掴んでいる場合に解放する(sudo)
   ./write-url.sh --print-ndef  TARGET_URL から生成される NDEF バイト列を表示して終了
   ./write-url.sh --read        カードに書かれている NDEF URL を読み取って表示
   ./write-url.sh --no-backup   書き込み前のバックアップを行わない
@@ -86,25 +100,28 @@ ${BOLD}write-url.sh${RST} — NFC タグに NDEF URL を書き込む (ACR122U / 
   ./write-url.sh --yes         確認プロンプトを省略する
   ./write-url.sh --help        このヘルプ
 
-カード種別の自動判定:
-  nfc-list の SAK 値からカード種別を判定して処理を振り分けます。
-    ・MIFARE Classic 1K/4K … 通常対応(主対象)
-    ・NTAG213/215/216(Type2) … ${YEL}実験的対応${RST}(--yes もしくは確認が必要)
-    ・MIFARE DESFire(Type4) … ${YEL}実験的対応${RST}
-    ・FeliCa … 非対応
-  ※ MIFARE Classic の読み書きには NXP系チップのリーダー(ACR122U など)が必須です。
-    Sony RC-S300 等の FeliCa系/PC-SC リーダーでは MIFARE Classic を扱えません。
+対応リーダー:
+  libnfc が対応する ${BOLD}NXP系${RST}リーダーが必要です(代表例: ${BOLD}ACR122U${RST})。
+  ${YEL}Sony PaSoRi/RC-S300 等の FeliCa系/PC-SC リーダーは使用できません${RST}
+  (libnfc の nfc_open が失敗するため)。複数リーダーが挿さっている場合は、
+  接続中の対応リーダーを自動検出して既定デバイスに固定します(select_reader)。
+
+対応タグ(SAK から自動判定):
+    ・MIFARE Classic 1K/4K … ${GRN}正式対応${RST}(主対象)
+    ・NTAG213/215/216・Type2 … ${YEL}実験的対応${RST}(確認が必要)
+    ・MIFARE DESFire・Type4 … ${YEL}実験的対応${RST}
+    ・FeliCa … ${RED}非対応${RST}
 
 安定性: リーダー検出・各操作は自動で最大 ${RETRY_MAX} 回まで再試行します。
         失敗が続く場合は ./write-url.sh --fix-reader でリーダーを解放し抜き差ししてください。
 
-処理の流れ: nfc-list で認識確認 → (Classicのみ)バックアップ → (--format 時のみ)フォーマット
-           → URL 書き込み → read-ndef で検証
+処理の流れ: リーダー選択(NXP系を固定) → 認識確認 → (Classicのみ)バックアップ
+           → (--format 時のみ)フォーマット → URL 書き込み → read-ndef で検証
 EOF
 }
 
 # --- 引数パース --------------------------------------------------------------
-DO_FORMAT=0; ASSUME_YES=0; DO_BACKUP=1; FIX_READER=0; PRINT_NDEF=0; DO_READ=0; SELF_TEST=0
+DO_FORMAT=0; ASSUME_YES=0; DO_BACKUP=1; FIX_READER=0; PRINT_NDEF=0; DO_READ=0; SELF_TEST=0; DO_DETECT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --format)     DO_FORMAT=1 ;;
@@ -114,6 +131,7 @@ while [ $# -gt 0 ]; do
     --fix-reader) FIX_READER=1 ;;
     --print-ndef) PRINT_NDEF=1 ;;
     --read)       DO_READ=1 ;;
+    --detect)     DO_DETECT=1 ;;   # リーダー/カードの状態判定のみ(書き込まない)
     --self-test)  SELF_TEST=1 ;;   # 内部用: SAK 判定などの単体テスト
     -h|--help)    usage; exit 0 ;;
     *) err "不明なオプション: $1"; echo; usage; exit 2 ;;
@@ -128,6 +146,162 @@ trap cleanup EXIT
 
 # --- 共通ユーティリティ ------------------------------------------------------
 require_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  リーダー選択(安定性の要)
+# ═════════════════════════════════════════════════════════════════════════════
+# 問題: libfreefare/libnfc のツールは既定デバイス(nfc_open(NULL) もしくは
+#   nfc_list_devices の先頭)を開く。ACR122U と Sony PaSoRi が同時に挿さっていると、
+#   libnfc が Sony(pcsc:SONY FeliCa Port/PaSoRi)を既定に選び nfc_open が失敗、
+#   操作全体がこける。ACR122U がたまたま選ばれた時だけ成功する=不安定。
+#
+# 解決: nfc-scan-device で接続デバイスの connstring を列挙し、対応する NXP系
+#   リーダー(acr122_usb / acr122_pcsc[ACR122] / pn532_*)を優先順に選ぶ。
+#   Sony/FeliCa/PaSoRi は除外する。選んだデバイスの「ドライバ接頭辞」
+#   (例: acr122_usb)を LIBNFC_DEFAULT_DEVICE に設定して既定デバイスに固定する。
+#
+# なぜ「ドライバ接頭辞」なのか:
+#   ・LIBNFC_DEFAULT_DEVICE=acr122_usb は nfc_open(NULL) 系ツール
+#     (nfc-list / nfc-mfultralight / nfc-mfclassic)で ACR122U を直接開かせる。
+#   ・同時に nfc_list_devices の先頭へ acr122_usb を差し込むため、libfreefare の
+#     mifare-classic-* もそれを最初に開いて ACR122U を claim する。
+#   ・bus:dev 番号(acr122_usb:001:002 等)は ACR122U が open/close の度に
+#     再列挙されて変動するため、正確なアドレスの固定は不安定。ドライバ接頭辞なら
+#     その場で再列挙して現在のデバイスを掴むので確実。
+#
+# 検証結果(ACR122U + Sony PaSoRi 同時接続、本機): nfc-list 10/10・
+#   mifare-classic-read-ndef claim 12/12・nfc-mfultralight 10/10 で ACR122U を選択、
+#   Sony を掴んだ回数 0/10。
+
+READER_CONNSTRING=""   # 選択したフル connstring(例: acr122_usb:001:002)
+READER_DRIVER=""       # ドライバ接頭辞(例: acr122_usb) = LIBNFC_DEFAULT_DEVICE の値
+READER_NAME=""         # 人間可読名(例: ACS / ACR122U PICC Interface)
+READER_FOUND_LIST=""   # 見つかった全デバイス名(エラーメッセージ用)
+
+# nfc-scan-device -v の出力から、対応 NXP系リーダーの connstring を優先順で選ぶ。
+# 成功時: READER_CONNSTRING/READER_DRIVER/READER_NAME を設定して 0。
+# 失敗時(対応リーダー無し): READER_FOUND_LIST に検出名を残して 1。
+discover_reader() {
+  READER_CONNSTRING=""; READER_DRIVER=""; READER_NAME=""; READER_FOUND_LIST=""
+  local scan=""
+  # nfc-scan-device は対応/非対応を問わず接続デバイスを列挙する(nfc_open 失敗も表示)。
+  scan="$(nfc-scan-device -v 2>&1)" || true
+
+  # 検出された全 connstring を集める(選択判定用。空白を含まない接頭辞付きトークン)。
+  # nfc-scan-device は connstring を字下げ行で出す/または "nfc_open failed for X" で出す。
+  local conns
+  conns="$(printf '%s\n' "$scan" \
+    | grep -oiE '(acr122_usb|acr122_pcsc|pn532_uart|pn532_usb|pn532_spi|pn532_i2c|pcsc):[^"[:space:]]*' \
+    | sed 's/[[:space:]]*$//')" || true
+
+  # エラー表示用に「見つかったデバイスのフル名」も控える(空白を含む pcsc:SONY ... 等)。
+  #   ・"nfc_open failed for <connstring>" 行の <connstring>(行末まで=空白込み)
+  #   ・"- <name>:" のヘッダ行の <name>
+  local names
+  names="$(printf '%s\n' "$scan" \
+    | sed -nE 's/^[[:space:]]*nfc_open failed for[[:space:]]*(.+)$/\1/p; s/^-[[:space:]]*(.+):[[:space:]]*$/\1/p')" || true
+  READER_FOUND_LIST="$(printf '%s\n' "$names" | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+  # フル名が取れなければ connstring 一覧で代替。
+  if [ -z "$READER_FOUND_LIST" ]; then
+    READER_FOUND_LIST="$(printf '%s\n' "$conns" | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+  fi
+
+  # 優先順に選ぶ。各グループ内で最初にマッチした connstring を採用。
+  #   1) acr122_usb:*            (最も確実)
+  #   2) acr122_pcsc:*ACR122*    (PC/SC 経由の ACR122 も可)
+  #   3) pn532_*                 (PN532 系リーダー)
+  # 除外: pcsc:*SONY* / *FeliCa* / *PaSoRi*(非対応)
+  local c prefix
+  # グループ1: acr122_usb
+  c="$(printf '%s\n' "$conns" | grep -iE '^acr122_usb:' | head -1)" || true
+  if [ -z "$c" ]; then
+    # グループ2: acr122_pcsc(ただし ACR122 を名に含むもの)
+    c="$(printf '%s\n' "$conns" | grep -iE '^acr122_pcsc:.*ACR122' | head -1)" || true
+  fi
+  if [ -z "$c" ]; then
+    # グループ3: pn532_*
+    c="$(printf '%s\n' "$conns" | grep -iE '^pn532_' | head -1)" || true
+  fi
+
+  if [ -z "$c" ]; then
+    return 1
+  fi
+
+  READER_CONNSTRING="$c"
+  # ドライバ接頭辞 = 最初の ':' より前(例: acr122_usb:001:002 → acr122_usb)
+  prefix="${c%%:*}"
+  READER_DRIVER="$prefix"
+  return 0
+}
+
+# 選択した connstring を実際に開いて、libnfc が名乗る人間可読名を取得する。
+# LIBNFC_DEFAULT_DEVICE を固定した状態で nfc-list を実行し "NFC device: ..." を拾う。
+# 併せて、実際に対応リーダーが開けることを確認する(開けなければ 1)。
+probe_reader_name() {
+  local out name
+  out="$(LIBNFC_DEFAULT_DEVICE="$READER_DRIVER" nfc-list 2>&1)" || true
+  # "NFC device: <name> opened" のうち、汎用の "user defined default device" 以外を優先。
+  name="$(printf '%s\n' "$out" \
+    | grep -iE 'NFC device:.*opened' \
+    | grep -viE 'user defined default device' \
+    | sed -E 's/.*NFC device:[[:space:]]*(.*) opened.*/\1/' \
+    | head -1)" || true
+  if [ -z "$name" ]; then
+    # フォールバック: 何か開けていれば connstring を名前代わりに使う。
+    if printf '%s\n' "$out" | grep -qiE 'NFC device:.*opened'; then
+      name="$READER_CONNSTRING"
+    fi
+  fi
+  READER_NAME="$name"
+  [ -n "$name" ] && return 0 || return 1
+}
+
+# select_reader: 対応リーダーを検出し LIBNFC_DEFAULT_DEVICE を固定する。
+#   成功: 環境変数 LIBNFC_DEFAULT_DEVICE をエクスポートし、READER_NAME を設定、0 を返す。
+#   失敗: 明確な日本語メッセージを出して 1 を返す(呼び出し側で die する)。
+# 注: bus:dev は変動しうるため毎回この関数で再検出する。
+select_reader() {
+  if ! require_cmd nfc-scan-device; then
+    # nfc-scan-device が無い環境では従来どおり既定デバイスに委ねる(固定はしない)。
+    warn "nfc-scan-device が見つからないため、リーダーの自動固定をスキップします。"
+    return 0
+  fi
+  if ! discover_reader; then
+    err "利用可能な対応リーダーが見つかりません。接続中: ${READER_FOUND_LIST:-なし}。ACR122U 等の libnfc 対応(NXP系)リーダーが必要です。Sony PaSoRi/RC-S300(FeliCa)はこのツールでは使用できません。"
+    return 1
+  fi
+  # 既定デバイスをドライバ接頭辞で固定(nfc_open(NULL)/nfc_list_devices 双方に効く)。
+  export LIBNFC_DEFAULT_DEVICE="$READER_DRIVER"
+  # 人間可読名を取得(取得できなくても致命的ではない)。
+  probe_reader_name || true
+  return 0
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ACR122U ブザー(ピッ音)ヘルパ — ベストエフォート(失敗しても操作は止めない)
+# ═════════════════════════════════════════════════════════════════════════════
+# reader_beep MODE : MODE = enable | beep
+#   ・選択リーダーが ACR122U(acr122_usb ドライバ)のときのみ実行する。
+#   ・./bin/acr122-beep を使う。無ければ libusb がある場合に build-tools.sh でビルドを試みる。
+#   ・libnfc がデバイスを掴んでいる間は claim に失敗するため、必ず nfc 系サブプロセスの
+#     合間/完了後に呼ぶこと。どんな失敗も無視する(効果音の afplay が保証フォールバック)。
+reader_beep() {
+  local mode="$1"
+  # ACR122U(acr122_usb)を選択している時だけ。それ以外(pn532 等)は無音でスキップ。
+  case "$READER_DRIVER" in
+    acr122_usb) : ;;
+    *) return 0 ;;
+  esac
+  # ヘルパが無ければ、libusb がある場合のみビルドを試みる(失敗は無視)。
+  if [ ! -x "$BEEP_BIN" ]; then
+    if require_cmd brew && [ -f "$(brew --prefix libusb 2>/dev/null)/include/libusb-1.0/libusb.h" ] 2>/dev/null; then
+      "$SCRIPT_DIR/build-tools.sh" >/dev/null 2>&1 || true
+    fi
+  fi
+  [ -x "$BEEP_BIN" ] || return 0
+  "$BEEP_BIN" "$mode" >/dev/null 2>&1 || true
+  return 0
+}
 
 confirm() {
   [ "$ASSUME_YES" -eq 1 ] && return 0
@@ -346,6 +520,17 @@ ensure_ndef_tools() {
 # check_reader: nfc-list をリトライ付きで実行し、認識確認とカード種別判定を行う。
 #   NFC_LIST_OUT にツール出力を保存し、TAG_TYPE/TAG_SAK/TAG_DEVICE を設定する。
 check_reader() {
+  # まず対応リーダー(NXP系)を検出し、既定デバイスを固定する(安定性の要)。
+  info "接続中の NFC リーダーを確認し、対応リーダーを選択します…"
+  select_reader || die "対応リーダーの選択に失敗しました。"
+  if [ -n "$READER_NAME" ]; then
+    ok "使用リーダーを選択しました。"
+    # アプリが拾えるよう、機械可読な1行を出力する。
+    printf '使用リーダー: %s\n' "$READER_NAME"
+    # 選択直後に ACR122U のブザー(カード検出時ピッ)を再有効化(失われた設定の復元)。
+    reader_beep enable
+  fi
+
   info "nfc-list で NFC リーダー/カードの認識を確認します…"
   local out rc=0
   # nfc-list 自体をリトライ(他 Mac での掴み合いによる初回失敗対策)
@@ -759,6 +944,86 @@ read_card() {
   esac
 }
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  --detect: リーダー/カードの状態判定のみ(高速・読み取り専用・書き込まない)
+# ═════════════════════════════════════════════════════════════════════════════
+# アプリのステータスパネル用。機械可読な行を出力する:
+#   READER: <name or NONE>
+#   TAG: <classic|type2|type4|felica|none|unknown> [<SAK>]
+# に続けて日本語の要約を出す。カードが無くてもハングしない(単発・短時間)。
+# フル読み取り(NDEF)は行わず、nfc-list の SAK 判定のみで種別を出す。
+detect_status() {
+  require_cmd xxd >/dev/null 2>&1 || true
+  if ! require_cmd nfc-list; then
+    echo "READER: NONE"
+    echo "TAG: none"
+    err "libnfc(nfc-list)が見つかりません。'brew install libnfc libfreefare' を実行してください。"
+    return 1
+  fi
+
+  # 対応リーダーを検出(見つからなければ NONE を出して終了)。
+  if ! require_cmd nfc-scan-device || ! discover_reader; then
+    echo "READER: NONE"
+    echo "TAG: none"
+    local found="${READER_FOUND_LIST:-なし}"
+    warn "対応リーダーが見つかりません。接続中: ${found}。ACR122U 等の libnfc 対応(NXP系)リーダーが必要です(Sony PaSoRi/RC-S300 は非対応)。"
+    return 1
+  fi
+  export LIBNFC_DEFAULT_DEVICE="$READER_DRIVER"
+
+  # カード判定は nfc-list 単発(リトライ無し=--detect は速度優先)。
+  # この nfc-list の出力からリーダー名も同時に拾う(probe 用の追加呼び出しを省く)。
+  local out=""
+  out="$(nfc-list 2>&1)" || true
+  parse_tag_type "$out"
+
+  # リーダー名: nfc-list の "NFC device: <name> opened" のうち汎用名以外を優先。
+  local rname
+  rname="$(printf '%s\n' "$out" \
+    | grep -iE 'NFC device:.*opened' \
+    | grep -viE 'user defined default device' \
+    | sed -E 's/.*NFC device:[[:space:]]*(.*) opened.*/\1/' \
+    | head -1)" || true
+  # 取得できなければ connstring、それも無ければ UNKNOWN。
+  [ -n "$rname" ] || rname="${READER_CONNSTRING:-UNKNOWN}"
+  READER_NAME="$rname"
+  echo "READER: $rname"
+
+  # カードの有無を判定。ISO14443A/FeliCa ターゲットが無ければ none。
+  local has_target=0
+  if printf '%s\n' "$out" | grep -qiE 'passive target\(s\) found|ISO14443A|ISO/IEC 14443|FeliCa'; then
+    if printf '%s\n' "$out" | grep -qiE '0 (ISO14443A|FeliCa).*passive target'; then
+      has_target=0
+    else
+      has_target=1
+    fi
+  fi
+
+  if [ "$has_target" -eq 0 ]; then
+    echo "TAG: none"
+    ok "使用リーダー: ${rname}"
+    info "カードは検出されていません。カードをリーダーに置いてください。"
+    return 0
+  fi
+
+  # 種別と SAK を出力(SAK が無い felica 等は SAK 省略)。
+  if [ -n "$TAG_SAK" ]; then
+    echo "TAG: $TAG_TYPE $TAG_SAK"
+  else
+    echo "TAG: $TAG_TYPE"
+  fi
+
+  ok "使用リーダー: ${rname}"
+  case "$TAG_TYPE" in
+    classic) info "カードを検出: MIFARE Classic(正式対応) SAK=${TAG_SAK}" ;;
+    type2)   info "カードを検出: NTAG/Type2(実験的対応) SAK=${TAG_SAK}" ;;
+    type4)   info "カードを検出: DESFire/Type4(実験的対応) SAK=${TAG_SAK}" ;;
+    felica)  warn "カードを検出: FeliCa(非対応)。NTAG213/215/216 か MIFARE Classic をご利用ください。" ;;
+    *)       warn "カードを検出しましたが種別を判別できません(SAK=${TAG_SAK:-不明})。" ;;
+  esac
+  return 0
+}
+
 print_iphone_note() {
   cat <<EOF
 
@@ -884,6 +1149,12 @@ fi
 if [ "$FIX_READER" -eq 1 ]; then
   fix_reader
   exit 0
+fi
+
+# --detect: リーダー/カードの状態判定のみ(書き込まない・高速)
+if [ "$DO_DETECT" -eq 1 ]; then
+  detect_status
+  exit $?
 fi
 
 # --read: カード内容を読み取って終了

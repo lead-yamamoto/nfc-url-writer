@@ -33,6 +33,47 @@ mkdir -p "$OUT_BIN"
 work="$(mktemp -d -t ffbuild.XXXXXX)"
 trap 'rm -rf "$work"' EXIT
 
+# --- ACR122U ブザー制御ヘルパ(任意・libusb がある場合のみ) -----------------
+# app-src/acr122-beep.c を ./bin/acr122-beep へビルドする。
+# libfreefare ツールのビルドより先に実行する:
+#   ・ブザーは libnfc/libfreefare とは独立した機能(libusb のみ依存)。
+#   ・libfreefare 例のビルドが失敗して die しても、ブザーヘルパは既にビルド済みにする。
+# libusb が無い環境ではスキップする(ブザーは任意機能で、失敗しても全体を止めない)。
+build_beep() {
+  local src="$SCRIPT_DIR/app-src/acr122-beep.c"
+  local out="$OUT_BIN/acr122-beep"
+  [ -f "$src" ] || { say "acr122-beep.c が無いためブザーヘルパはスキップします。"; return 0; }
+
+  # libusb の prefix と CFLAGS/LDFLAGS を決める。
+  # 優先1: pkg-config(pkgconf) があればそれを使う。
+  # 優先2: brew --prefix libusb から直接 -I/-L を組み立てる(pkg-config 不要)。
+  local cflags="" ldflags=""
+  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libusb-1.0 2>/dev/null; then
+    cflags="$(pkg-config --cflags libusb-1.0)"
+    ldflags="$(pkg-config --libs libusb-1.0)"
+  else
+    local usb_prefix
+    usb_prefix="$(brew --prefix libusb 2>/dev/null || true)"
+    if [ -z "$usb_prefix" ] || [ ! -f "$usb_prefix/include/libusb-1.0/libusb.h" ]; then
+      say "libusb が見つからないためブザーヘルパはスキップします('brew install libusb' で有効化)。"
+      return 0
+    fi
+    cflags="-I$usb_prefix/include"
+    ldflags="-L$usb_prefix/lib -Wl,-rpath,$usb_prefix/lib -lusb-1.0"
+  fi
+
+  say "ビルド: acr122-beep (ブザー制御ヘルパ)"
+  # shellcheck disable=SC2086  # cflags/ldflags は意図的に分割展開する
+  if clang $cflags "$src" $ldflags -o "$out" 2>/dev/null; then
+    printf '    built: %s\n' "$out"
+  else
+    say "acr122-beep のビルドに失敗しました(任意機能のため無視して続行します)。"
+  fi
+}
+
+# 先にブザーヘルパをビルド(libfreefare の失敗に巻き込まれないように)。
+build_beep
+
 for t in "${TOOLS[@]}"; do
   say "取得: $t.c ($REF)"
   curl -fsSL "$BASE_URL/$t.c" -o "$work/$t.c" \
