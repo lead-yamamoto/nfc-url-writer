@@ -112,12 +112,37 @@ final class AppModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let result = AppModel.execute(action: action, url: u, backupDir: backup)
             DispatchQueue.main.async {
-                self.log = result.1.isEmpty ? "(出力なし)" : result.1
+                var text = result.1.isEmpty ? "(出力なし)" : result.1
+                if result.0 != 0 {
+                    text += AppModel.failureHint(for: result.1)
+                }
+                self.log = text
                 self.busy = false
                 self.status = result.0 == 0 ? "成功" : "失敗"
                 self.statusKind = result.0 == 0 ? 2 : 3
             }
         }
+    }
+
+    /// 失敗時の出力を検査し、既知のシグネチャに一致したら日本語のヒント行を追記する。
+    /// （単純な文字列包含チェックのみ。スクリプト側の案内と重複しない補足を足す。）
+    static func failureHint(for output: String) -> String {
+        // (c) NXP系リーダー必須のメッセージは既に十分明確なので、追加ヒントは出さない。
+        if output.contains("NXP系チップのリーダー") {
+            return ""
+        }
+        // (a) リーダーを macOS が掴んでいる / デバイスが見つからない
+        if output.contains("Unable to claim USB interface")
+            || output.contains("No NFC device found") {
+            return "\n\n──────────\n💡 ヒント: リーダーが認識されていないようです。"
+                + "「リーダー解放」ボタンを押し、ACR122U を一度抜き差ししてから、もう一度お試しください。"
+        }
+        // (b) カードがまだ空 / NDEF 未フォーマット
+        if output.contains("まだ空です") || output.contains("No MAD detected") {
+            return "\n\n──────────\n💡 ヒント: このカードにはまだ何も書かれていません。"
+                + "先に「書き込む」を押してから、もう一度お試しください。"
+        }
+        return ""
     }
 
     static func execute(action: String, url: String, backupDir: String) -> (Int32, String) {
