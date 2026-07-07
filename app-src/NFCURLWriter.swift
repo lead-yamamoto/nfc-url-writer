@@ -178,6 +178,22 @@ final class AppModel: ObservableObject {
     @Published var toastShown: Bool = false
     private var toastToken: Int = 0
 
+    // アプリ自身が鳴らす効果音。NSSound は再生前に解放されると鳴らないため
+    // プロパティで保持しておく（.app では script のバックグラウンド afplay が
+    // 失われて無音になるため、完了時はアプリ側で確実に鳴らす）。
+    private var completionSound: NSSound?
+
+    /// 操作完了時にアプリ側で成功/失敗音を鳴らす（write/format/read のみ）。
+    /// System サウンド: 成功=Glass / 失敗=Basso。
+    private func playCompletionSound(success: Bool) {
+        let path = success
+            ? "/System/Library/Sounds/Glass.aiff"
+            : "/System/Library/Sounds/Basso.aiff"
+        let sound = NSSound(contentsOfFile: path, byReference: true)
+        completionSound = sound   // 再生完了まで保持
+        sound?.play()
+    }
+
     init() {
         if let saved = UserDefaults.standard.string(forKey: "targetURL"), !saved.isEmpty {
             url = saved
@@ -196,6 +212,67 @@ final class AppModel: ObservableObject {
 
     static func scriptPath() -> String? {
         Bundle.main.path(forResource: "write-url", ofType: "sh")
+    }
+
+    // MARK: DMG クリーンアップ（起動時に一度だけ）
+
+    /// 起動ごとに一度だけ DMG 後始末プロンプトを出すためのガード。
+    private static var didOfferDMGCleanup = false
+
+    /// リリース DMG のボリューム名（マウント先 /Volumes/NFC URL Writer）。
+    private static let dmgVolumeName = "NFC URL Writer"
+
+    /// "NFC URL Writer" ボリュームがマウント中なら、DMG の取り出し/削除を促す。
+    /// 失敗はすべて無視（非致命）。起動につき一度だけ、マウント時のみ表示する。
+    func offerDMGCleanupIfMounted() {
+        guard !AppModel.didOfferDMGCleanup else { return }
+
+        let volPath = "/Volumes/\(AppModel.dmgVolumeName)"
+        var mounted = FileManager.default.fileExists(atPath: volPath)
+        if !mounted,
+           let vols = FileManager.default.mountedVolumeURLs(
+               includingResourceValuesForKeys: nil, options: []) {
+            mounted = vols.contains { $0.path == volPath }
+        }
+        guard mounted else { return }
+        AppModel.didOfferDMGCleanup = true
+
+        let alert = NSAlert()
+        alert.messageText = "インストール完了"
+        alert.informativeText = "ディスクイメージ(DMG)を取り出して、ダウンロード内のDMGファイルを削除しますか？"
+        alert.addButton(withTitle: "取り出して削除")   // 既定
+        alert.addButton(withTitle: "取り出すだけ")
+        alert.addButton(withTitle: "何もしない")
+
+        let resp = alert.runModal()
+        switch resp {
+        case .alertFirstButtonReturn:      // 取り出して削除
+            AppModel.ejectDMGVolume(at: volPath)
+            AppModel.trashDownloadedDMGs()
+        case .alertSecondButtonReturn:     // 取り出すだけ
+            AppModel.ejectDMGVolume(at: volPath)
+        default:                           // 何もしない
+            break
+        }
+    }
+
+    /// DMG ボリュームを取り出す（hdiutil detach）。失敗は無視。
+    private static func ejectDMGVolume(at path: String) {
+        _ = Shell.run("/usr/bin/hdiutil", ["detach", path], env: Shell.augmentedEnv())
+    }
+
+    /// ~/Downloads 内の NFC-URL-Writer*.dmg をゴミ箱へ移動する。失敗は無視。
+    private static func trashDownloadedDMGs() {
+        let fm = FileManager.default
+        guard let downloads = fm.urls(for: .downloadsDirectory, in: .userDomainMask).first,
+              let items = try? fm.contentsOfDirectory(
+                  at: downloads, includingPropertiesForKeys: nil, options: []) else { return }
+        for url in items {
+            let name = url.lastPathComponent
+            guard name.hasPrefix("NFC-URL-Writer"),
+                  name.lowercased().hasSuffix(".dmg") else { continue }
+            try? fm.trashItem(at: url, resultingItemURL: nil)
+        }
     }
 
     static func defaultURLFromScript() -> String? {
@@ -274,6 +351,12 @@ final class AppModel: ObservableObject {
                 self.statusKind = ok ? 2 : 3
                 // 各操作の出力からリーダー/カード状態を拾って更新（--detect の再実行は避ける）。
                 self.mergeDetect(from: result.1)
+                // アプリ側で効果音を鳴らす（write/format/read の完了時のみ。
+                // fix/install/detect では鳴らさない）。script 側は NFC_SOUND=0 で
+                // afplay を抑止しているが、リーダーのハードビープは別途鳴る。
+                if action == "write" || action == "format" || action == "read" {
+                    self.playCompletionSound(success: ok)
+                }
                 // トースト表示
                 if action == "fix" {
                     self.showToast(ok ? "リーダー解放を実行しました" : "リーダー解放に失敗しました",
@@ -421,7 +504,11 @@ final class AppModel: ObservableObject {
         var args = [script]
         // NFC_VERBOSE=1: 生ツール出力(16進/UID/SAK 等)も含めてキャプチャする。
         // アプリは「かんたんログ」を既定表示し、この生出力は「詳細ログ」トグルで見せる。
-        var env: [String: String] = ["NFC_BACKUP_DIR": backupDir, "NFC_VERBOSE": "1"]
+        // NFC_SOUND=0: script のバックグラウンド afplay は .app では失われて無音に
+        // なるため抑止し、完了音はアプリ側(playCompletionSound)で確実に鳴らす。
+        // なお reader_beep(リーダー本体のハードビープ)は NFC_SOUND に依存せず鳴る。
+        var env: [String: String] = [
+            "NFC_BACKUP_DIR": backupDir, "NFC_VERBOSE": "1", "NFC_SOUND": "0"]
         switch action {
         case "write":  args += ["--yes"]; env["TARGET_URL"] = url
         case "format": args += ["--format", "--yes"]; env["TARGET_URL"] = url
@@ -771,6 +858,8 @@ struct ContentView: View {
         .onAppear {
             // 起動直後に一度だけ接続確認（連続ポーリングはしない）
             model.detectStatus(showBusy: true)
+            // DMG がマウント中なら取り出し/削除を促す（起動につき一度だけ）。
+            model.offerDMGCleanupIfMounted()
         }
     }
 
