@@ -669,15 +669,92 @@ format_card() {
   ok "初期化が完了しました"
 }
 
-_run_write_classic() { mifare-classic-write-ndef -y -i "$1" 2>&1 | detail; }
+# MIFARE Classic への NDEF 書き込み本体(1回分)。
+#   重要: mifare-classic-write-ndef は非デフォルト鍵のセクターに当たると libfreefare
+#   内部で SIGSEGV(終了コード139)することがある。bash のジョブ制御はこのとき
+#   "…line NNN: NNNN Segmentation fault: 11 mifare-classic-write-ndef…" という行を
+#   スクリプトの stderr へ直接出力し、これが detail パイプを迂回して かんたんログ に
+#   漏れてしまう。これを防ぐため、コマンドを「サブシェル内」で実行して出力を丸ごと
+#   変数に取り込み(2>&1)、ジョブ制御メッセージも含めて detail 経由でのみ流す。
+#   set -e/pipefail 下でも終了コードを正しく捕捉する($? を即座に受ける)。
+#   成功: 0 / 失敗: 元の終了コード(SIGSEGV は 139)を返す。
+_run_write_classic() {
+  local out rc=0
+  # サブシェルで実行し stdout+stderr を out へ。( … ) を "$( )" で囲うことで、
+  # 子プロセスのクラッシュ通知(Segmentation fault…)は現在シェルの stderr ではなく
+  # このサブシェルの stderr = 捕捉対象になり、かんたんログには一切出ない。
+  out="$( ( mifare-classic-write-ndef -y -i "$1" ) 2>&1 )" || rc=$?
+  # 捕捉した生出力は詳細ログにのみ流す(NFC_VERBOSE=1 のときだけ表示)。
+  # "Segmentation fault" 等の文言は detail が字下げして詳細扱いにするため、
+  # かんたんログ(既定)には決して現れない。
+  printf '%s\n' "$out" | detail
+  return "$rc"
+}
 
+# 通常の Classic 書き込み(リトライ付き)。ただし SIGSEGV(139)は決定論的な
+# クラッシュなので同じ書き込みを4回繰り返しても無意味 → 即座に呼び出し側へ返し、
+# フォーマット→再書き込みのフォールバックへ回す。
+# 成功: 0 / 失敗: 最終試行の終了コードを返す。
+_write_classic_with_retry() {
+  local attempt=1 rc=0
+  while :; do
+    rc=0
+    _run_write_classic "$1" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    # 139 (128+11 = SIGSEGV) は再試行しても同じ結果 → 即座に返してフォールバックへ。
+    if [ "$rc" -eq 139 ]; then
+      detail "書き込みがクラッシュしました(exit ${rc})。再試行せずカード初期化フォールバックへ移行します。"
+      return "$rc"
+    fi
+    if [ "$attempt" -ge "$RETRY_MAX" ]; then
+      return "$rc"
+    fi
+    attempt=$(( attempt + 1 ))
+    warn "書き込み: 失敗しました。再試行 ${attempt}/${RETRY_MAX}…"
+    sleep "$RETRY_SLEEP" || true
+  done
+}
+
+# MIFARE Classic の自己修復書き込み。
+#   1) 通常書き込みを試す(SIGSEGV は即フォールバック、その他は最大 RETRY_MAX 回)。
+#   2) それでも失敗したら、バックアップは既に取得済み・ユーザは上書き前提なので、
+#      自動で mifare-classic-format を実行して全セクターを既定鍵へ戻し、
+#      書き込みを「もう一度だけ」試す。
+#   3) 再書き込みも失敗したら die()。
+#   既に --format 指定でこの実行内でフォーマット済み(DO_FORMAT=1)の場合は
+#   二重フォーマットを避け、そのまま優しく失敗する。
 write_url() {
   build_ndef_message "$TARGET_URL" "$TMP_WORK/ndef.bin"
   info "書き込み中です…（${TARGET_URL}）"
   detail "NDEF メッセージ ($(wc -c < "$TMP_WORK/ndef.bin" | tr -d ' ') バイト): $(xxd -p "$TMP_WORK/ndef.bin" | tr -d '\n')"
+
   local rc=0
-  retry "書き込み" _run_write_classic "$TMP_WORK/ndef.bin" || rc=$?
-  [ "$rc" -eq 0 ] || die "書き込みに失敗しました。カードを置き直してもう一度お試しください。"
+  _write_classic_with_retry "$TMP_WORK/ndef.bin" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "書き込みが完了しました"
+    return 0
+  fi
+
+  # ここに来た = 通常書き込みが失敗(SIGSEGV 含む)。
+  # 既にこの実行でフォーマット済みなら、これ以上できることはない。
+  if [ "$DO_FORMAT" -eq 1 ]; then
+    die "書き込みに失敗しました。カードが特殊な鍵で保護されている可能性があります（別のMIFARE Classicカードでお試しください）。"
+  fi
+
+  # 自動フォーマット→再書き込みフォールバック。
+  # 背景: カードが以前に使われ/フォーマットされ非デフォルト鍵を持つと、NDEF が
+  #   高位セクターに跨ったときに libfreefare が認証失敗を誤処理してクラッシュする。
+  #   mifare-classic-format は内蔵の既定鍵テーブル(FF.. / A0A1.. / D3F7.. 等)で
+  #   全セクターを既定鍵へリセットするため、その後の書き込みは成功する。
+  info "通常の書き込みに失敗しました。カードを初期化してから書き込み直します…"
+  format_card   # 失敗時は die する
+
+  info "書き込み直しています…（${TARGET_URL}）"
+  rc=0
+  _write_classic_with_retry "$TMP_WORK/ndef.bin" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    die "書き込みに失敗しました。カードが特殊な鍵で保護されている可能性があります（別のMIFARE Classicカードでお試しください）。"
+  fi
   ok "書き込みが完了しました"
 }
 
