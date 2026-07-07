@@ -659,7 +659,13 @@ backup_card() {
   fi
 }
 
-_run_format() { mifare-classic-format -y 2>&1 | detail; }
+# libfreefare の NDEF ツール(mifare-classic-*/mifare-desfire-*)は nfc_list_devices() で
+# 全デバイスを総当りするため、LIBNFC_DEFAULT_DEVICE 固定が生む「同一リーダーの二重列挙」で
+# クラッシュ(exit 134)する。これらは固定を外して実行する(総当りで Sony 等は自動スキップ)。
+# 一方 nfc-list/nfc-mfclassic/nfc-mfultralight は nfc_open(NULL)=先頭デバイスを開くため固定を維持。
+ndef_tool() { env -u LIBNFC_DEFAULT_DEVICE "$@"; }
+
+_run_format() { ndef_tool mifare-classic-format -y 2>&1 | detail; }
 
 format_card() {
   info "カードを初期化しています…"
@@ -683,7 +689,7 @@ _run_write_classic() {
   # サブシェルで実行し stdout+stderr を out へ。( … ) を "$( )" で囲うことで、
   # 子プロセスのクラッシュ通知(Segmentation fault…)は現在シェルの stderr ではなく
   # このサブシェルの stderr = 捕捉対象になり、かんたんログには一切出ない。
-  out="$( ( mifare-classic-write-ndef -y -i "$1" ) 2>&1 )" || rc=$?
+  out="$( ( ndef_tool mifare-classic-write-ndef -y -i "$1" ) 2>&1 )" || rc=$?
   # 捕捉した生出力は詳細ログにのみ流す(NFC_VERBOSE=1 のときだけ表示)。
   # "Segmentation fault" 等の文言は detail が字下げして詳細扱いにするため、
   # かんたんログ(既定)には決して現れない。
@@ -761,7 +767,7 @@ write_url() {
 # read-ndef をリトライ付きで実行。成功時 readback.bin を生成。
 # 出力は READ_NDEF_OUT に保持(空カード判定などに使う)。戻り値は最終試行の終了コード。
 _read_ndef_classic() {
-  READ_NDEF_OUT="$(mifare-classic-read-ndef -y -o "$1" 2>&1)"
+  READ_NDEF_OUT="$(ndef_tool mifare-classic-read-ndef -y -o "$1" 2>&1)"
   local rc=$?
   printf '%s\n' "$READ_NDEF_OUT" | detail
   return "$rc"
@@ -931,9 +937,9 @@ write_url_type2() {
 # ═════════════════════════════════════════════════════════════════════════════
 #  実験的: Type4 (MIFARE DESFire)
 # ═════════════════════════════════════════════════════════════════════════════
-_df_create() { mifare-desfire-create-ndef -y 2>&1 | detail; }
-_df_write()  { mifare-desfire-write-ndef -y -i "$1" 2>&1 | detail; }
-_df_read()   { mifare-desfire-read-ndef -y -o "$1" 2>&1 | detail; }
+_df_create() { ndef_tool mifare-desfire-create-ndef -y 2>&1 | detail; }
+_df_write()  { ndef_tool mifare-desfire-write-ndef -y -i "$1" 2>&1 | detail; }
+_df_read()   { ndef_tool mifare-desfire-read-ndef -y -o "$1" 2>&1 | detail; }
 
 write_url_type4() {
   warn "このカード（DESFire）への書き込みは実験的機能です。"

@@ -62,6 +62,7 @@ The tool auto-detects the tag type from its SAK (or FeliCa signaling) on every r
 
 - **Three interfaces, one engine** — native app, CLI, and a local web GUI, all calling the same audited `write-url.sh`.
 - **Smart reader selection** — automatically picks a working NXP reader (e.g. ACR122U) and skips incompatible ones like a Sony PaSoRi/FeliCa reader, fixing the flakiness on Macs that have both. It does this by pinning `LIBNFC_DEFAULT_DEVICE` to the working driver, so both `nfc-list`-style tools and libfreefare's `mifare-classic-*` tools consistently open the right device instead of racing (or getting stuck on the wrong one).
+- **Fixed a regression where MIFARE Classic read/write could crash on some setups** because the reader-pinning above enumerated the reader twice for libfreefare's NDEF tools; those tools now run with the pin unset.
 - **ACR122U beep restored** via a small bundled libusb helper (`acr122-beep`) that fires the reader's own buzzer on success — falls back to a Mac sound if the helper isn't available for your architecture.
 - **Live reader/tag status + supported-compat panel in the app** — a status panel shows which reader and tag type are currently detected (with color-coded confidence), plus an expandable panel listing supported readers and tag types, so you know what to expect before you write.
 - **One-click setup** — the app detects whether `libnfc` / `libfreefare` are present and **installs them via Homebrew on first run** (with live progress), so non-technical users can get going without touching a terminal.
